@@ -1,19 +1,30 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
+import sqlite3
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
-import requests
-from fastapi import FastAPI, HTTPException, Query, Request
+import httpx
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
-from openai import OpenAI
+from openai import APIError, OpenAI
 from pydantic import BaseModel, Field
 
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger("ellenai")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN", "")
@@ -21,19 +32,17 @@ PAGE_ID = os.getenv("PAGE_ID", "")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "ANY_STRING")
 APP_SECRET = os.getenv("APP_SECRET", "")
 
+STATE_DB_PATH = Path(os.getenv("STATE_DB_PATH", "ellenai_state.db"))
+MESSAGE_SEND_DELAY_SECONDS = float(os.getenv("MESSAGE_SEND_DELAY_SECONDS", "5"))
+ENABLE_REPLY_REWRITE = os.getenv("ENABLE_REPLY_REWRITE", "1") == "1"
+REWRITE_CACHE_TTL_SECONDS = int(os.getenv("REWRITE_CACHE_TTL_SECONDS", "900"))
+INTENT_CACHE_TTL_SECONDS = int(os.getenv("INTENT_CACHE_TTL_SECONDS", "300"))
+
 PRODUCT = {
     "name": "Oversized Hoodie",
     "price": 2500,
     "currency": "BDT",
     "delivery": "3-5 days",
-}
-
-ORNAMENT_COMPLIMENTS = {
-    "necklace": "eta porle apnar look ta onek elegant and classy dekhabe",
-    "earrings": "eta apnar face-cut ke onek beautifully highlight korbe",
-    "ring": "eta apnar hand look ke super premium feel dibe",
-    "bracelet": "eta apnar outfit er sathe onek chic vibe dibe",
-    "anklet": "eta apnar style e onek soft and graceful touch add korbe",
 }
 
 BARGAIN_WINDOW_SECONDS = 120
@@ -47,19 +56,20 @@ Tone:
 * Slightly girly
 * Bangla + English mix (Banglish)
 * Casual, fun
-* Use emojis (😍😊✨)
 
 Rules:
 
 * Short replies (1-2 lines)
 * Natural and human
 * Never change price or totals
+* Do not invent discounts
+* If user negotiates price, stay polite but firm
 """
 
 STYLE_EXAMPLES = """
-apu eta onek cute, ami nijeyo use kortesi 😍
+apu eta onek cute, ami nijeyo use kortesi
 price 2500, quality onek bhalo trust me
-delivery 3-5 days lagbe apu 😊
+delivery 3-5 days lagbe apu
 niben naki? ami confirm kore rakhi?
 """
 
@@ -80,9 +90,10 @@ COLOR_WORDS = {
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 app = FastAPI(title="EllenAI Sales Assistant")
 
-# In-memory session store for MVP.
-user_sessions: dict[str, dict[str, Any]] = {}
-user_message_history: dict[str, list[dict[str, Any]]] = {}
+# In-memory caches to reduce OpenAI call frequency.
+intent_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+rewrite_cache: dict[str, tuple[float, str]] = {}
+session_cache: dict[str, dict[str, Any]] = {}
 
 
 class TestRequest(BaseModel):
@@ -90,6 +101,45 @@ class TestRequest(BaseModel):
     message: str
     attachments_count: int = 0
     attachment_types: list[str] = Field(default_factory=list)
+    attachment_urls: list[str] = Field(default_factory=list)
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def init_db() -> None:
+    STATE_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(STATE_DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+                user_id TEXT PRIMARY KEY,
+                session_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS message_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                text TEXT NOT NULL,
+                attachments_count INTEGER NOT NULL,
+                attachment_types_json TEXT NOT NULL,
+                attachment_urls_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_history_user ON message_history(user_id)")
+    logger.info("State DB initialized at %s", STATE_DB_PATH)
+
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    await asyncio.to_thread(init_db)
 
 
 def _new_session() -> dict[str, Any]:
@@ -99,6 +149,7 @@ def _new_session() -> dict[str, Any]:
         "upsell_used": False,
         "bargain_timestamps": [],
         "payment_proof_received": False,
+        "unknown_count": 0,
         "cart": {
             "items": [],
             "total_price": 0,
@@ -120,7 +171,7 @@ def _normalize_intent(data: dict[str, Any]) -> dict[str, Any]:
 
     color_raw = data.get("color")
     color = str(color_raw).strip().lower() if color_raw else None
-    if color == "null" or color == "none":
+    if color in {"null", "none", ""}:
         color = None
 
     location_raw = data.get("location")
@@ -187,15 +238,6 @@ def _fallback_detect(message: str) -> dict[str, Any]:
     }
 
 
-def _extract_ornament_name(message: str) -> str | None:
-    text = message.lower()
-    names = ["necklace", "earrings", "ring", "bracelet", "anklet", "chain", "pendant"]
-    for name in names:
-        if re.search(rf"\b{re.escape(name)}\b", text):
-            return name
-    return None
-
-
 def _is_price_argument(message: str) -> bool:
     text = message.lower()
     markers = [
@@ -205,7 +247,14 @@ def _is_price_argument(message: str) -> bool:
     return any(m in text for m in markers)
 
 
-def detect_intent(message: str) -> dict[str, Any]:
+def _prune_cache(cache: dict[str, tuple[float, Any]], ttl_seconds: int) -> None:
+    now = time.time()
+    stale = [k for k, (ts, _) in cache.items() if now - ts > ttl_seconds]
+    for k in stale:
+        cache.pop(k, None)
+
+
+def _detect_intent_sync(message: str) -> dict[str, Any]:
     if not message or not message.strip():
         return _normalize_intent(
             {
@@ -217,6 +266,11 @@ def detect_intent(message: str) -> dict[str, Any]:
                 "is_question": False,
             }
         )
+
+    cache_key = message.strip().lower()
+    cached = intent_cache.get(cache_key)
+    if cached and (time.time() - cached[0] <= INTENT_CACHE_TTL_SECONDS):
+        return dict(cached[1])
 
     prompt = f"""
 Extract structured shopping intent from this message.
@@ -232,7 +286,10 @@ Message:
 """
 
     if client is None:
-        return _normalize_intent(_fallback_detect(message))
+        result = _normalize_intent(_fallback_detect(message))
+        intent_cache[cache_key] = (time.time(), dict(result))
+        _prune_cache(intent_cache, INTENT_CACHE_TTL_SECONDS)
+        return result
 
     try:
         response = client.chat.completions.create(
@@ -244,25 +301,38 @@ Message:
             response_format={"type": "json_object"},
             temperature=0,
         )
-        parsed = json.loads(response.choices[0].message.content or "{}")
-        if parsed is None:
-            return _normalize_intent(_fallback_detect(message))
-        return _normalize_intent(parsed)
-    except Exception:
-        return _normalize_intent(
-            {
-                "intent": "unknown",
-                "quantity": 1,
-                "color": None,
-                "location": None,
-                "payment_detected": False,
-                "is_question": False,
-            }
-        )
+        content = response.choices[0].message.content or "{}"
+        parsed = json.loads(content)
+        result = _normalize_intent(parsed if isinstance(parsed, dict) else {})
+    except (APIError, json.JSONDecodeError, ValueError) as exc:
+        logger.exception("Intent detection failed: %s", exc)
+        result = _normalize_intent(_fallback_detect(message))
+
+    intent_cache[cache_key] = (time.time(), dict(result))
+    _prune_cache(intent_cache, INTENT_CACHE_TTL_SECONDS)
+    return result
 
 
-def rewrite_reply(text: str, allow_upsell: bool = False, tone: str = "default") -> str:
+async def detect_intent(message: str) -> dict[str, Any]:
+    return await asyncio.to_thread(_detect_intent_sync, message)
+
+
+def _rewrite_reply_sync(text: str, allow_upsell: bool = False, tone: str = "default") -> str:
     del tone
+    if not ENABLE_REPLY_REWRITE:
+        return text
+
+    # Avoid extra model calls for deterministic system lines.
+    if text.startswith("Order Summary:"):
+        return text
+
+    cache_key = f"{allow_upsell}|{text}"
+    cached = rewrite_cache.get(cache_key)
+    if cached and (time.time() - cached[0] <= REWRITE_CACHE_TTL_SECONDS):
+        return cached[1]
+
+    if client is None:
+        return text
 
     upsell_rule = "You may gently suggest buying more." if allow_upsell else "Do not upsell in this reply."
     rewrite_prompt = f"""
@@ -278,9 +348,6 @@ Reply text:
 {text}
 """
 
-    if client is None:
-        return text
-
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -291,9 +358,63 @@ Reply text:
             temperature=0.6,
         )
         rewritten = (response.choices[0].message.content or "").strip()
-        return rewritten if rewritten else text
-    except Exception:
-        return text
+        final_text = rewritten if rewritten else text
+    except APIError as exc:
+        logger.exception("Reply rewrite failed: %s", exc)
+        final_text = text
+
+    rewrite_cache[cache_key] = (time.time(), final_text)
+    _prune_cache(rewrite_cache, REWRITE_CACHE_TTL_SECONDS)
+    return final_text
+
+
+async def rewrite_reply(text: str, allow_upsell: bool = False, tone: str = "default") -> str:
+    return await asyncio.to_thread(_rewrite_reply_sync, text, allow_upsell, tone)
+
+
+def _analyze_payment_image_sync(image_url: str, message: str) -> bool:
+    if client is None or not image_url:
+        return False
+
+    prompt = (
+        "You are checking whether an image is a payment proof screenshot for ecommerce. "
+        "Respond only JSON: {\"is_payment_proof\": true|false, \"reason\": \"short text\"}. "
+        "Mark false for random photos, memes, product shots, or social posts. "
+        f"User text context: {message}"
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": image_url}},
+                    ],
+                }
+            ],
+            response_format={"type": "json_object"},
+            temperature=0,
+        )
+        parsed = json.loads(response.choices[0].message.content or "{}")
+        return bool(parsed.get("is_payment_proof", False))
+    except (APIError, json.JSONDecodeError, ValueError) as exc:
+        logger.exception("Payment image analysis failed: %s", exc)
+        return False
+
+
+async def analyze_payment_images(attachment_types: list[str], attachment_urls: list[str], message: str, state: int) -> bool:
+    if state != 3:
+        return False
+    normalized_types = {str(t).lower().strip() for t in attachment_types if str(t).strip()}
+    if "image" not in normalized_types:
+        return False
+    for url in attachment_urls:
+        if await asyncio.to_thread(_analyze_payment_image_sync, url, message):
+            return True
+    return False
 
 
 def _recalc_total(session: dict[str, Any]) -> None:
@@ -324,40 +445,126 @@ def _add_or_update_item(session: dict[str, Any], quantity: int, color: str | Non
 
 
 def _safe_default_reply() -> str:
-    return "Oops apu 😅 ami buste parini, kindly bolben ki niben?"
+    return "Oops apu, ami buste parini, kindly bolben ki niben?"
 
 
 def _super_confused_reply() -> str:
-    return "Lemme confirm from Ellen and get back to you right away apu 😊"
+    return "Lemme confirm from Ellen and get back to you right away apu"
 
 
-def _append_history(user_id: str, message: str, attachments_count: int, attachment_types: list[str] | None = None) -> None:
-    history = user_message_history.setdefault(user_id, [])
-    history.append(
-        {
-            "text": message,
-            "attachments_count": max(0, attachments_count),
-            "attachment_types": attachment_types or [],
-        }
+def db_save_session(user_id: str, session: dict[str, Any]) -> None:
+    payload = json.dumps(session, ensure_ascii=True)
+    with sqlite3.connect(STATE_DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO sessions(user_id, session_json, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                session_json=excluded.session_json,
+                updated_at=excluded.updated_at
+            """,
+            (user_id, payload, _utc_now_iso()),
+        )
+
+
+def db_get_session(user_id: str) -> dict[str, Any] | None:
+    with sqlite3.connect(STATE_DB_PATH) as conn:
+        row = conn.execute("SELECT session_json FROM sessions WHERE user_id = ?", (user_id,)).fetchone()
+    if row is None:
+        return None
+    try:
+        return json.loads(str(row[0]))
+    except json.JSONDecodeError:
+        logger.exception("Corrupt session for user %s", user_id)
+        return None
+
+
+def db_append_history(
+    user_id: str,
+    message: str,
+    attachments_count: int,
+    attachment_types: list[str],
+    attachment_urls: list[str],
+) -> None:
+    with sqlite3.connect(STATE_DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO message_history(
+                user_id, text, attachments_count, attachment_types_json, attachment_urls_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                message,
+                max(0, attachments_count),
+                json.dumps(attachment_types, ensure_ascii=True),
+                json.dumps(attachment_urls, ensure_ascii=True),
+                _utc_now_iso(),
+            ),
+        )
+
+
+def db_recent_history(user_id: str, limit: int = 20) -> list[dict[str, Any]]:
+    with sqlite3.connect(STATE_DB_PATH) as conn:
+        rows = conn.execute(
+            """
+            SELECT text, attachments_count, attachment_types_json, attachment_urls_json, created_at
+            FROM message_history
+            WHERE user_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (user_id, max(1, limit)),
+        ).fetchall()
+    result: list[dict[str, Any]] = []
+    for text, cnt, types_json, urls_json, created_at in reversed(rows):
+        try:
+            types = json.loads(str(types_json))
+        except json.JSONDecodeError:
+            types = []
+        try:
+            urls = json.loads(str(urls_json))
+        except json.JSONDecodeError:
+            urls = []
+        result.append(
+            {
+                "text": str(text),
+                "attachments_count": int(cnt),
+                "attachment_types": [str(t).lower() for t in (types or [])],
+                "attachment_urls": [str(u) for u in (urls or [])],
+                "created_time": str(created_at),
+            }
+        )
+    return result
+
+
+async def append_history(
+    user_id: str,
+    message: str,
+    attachments_count: int,
+    attachment_types: list[str] | None = None,
+    attachment_urls: list[str] | None = None,
+) -> None:
+    await asyncio.to_thread(
+        db_append_history,
+        user_id,
+        message,
+        attachments_count,
+        [str(t).lower().strip() for t in (attachment_types or [])],
+        [str(u).strip() for u in (attachment_urls or []) if str(u).strip()],
     )
-    if len(history) > 20:
-        del history[:-20]
 
 
-def _detect_payment_proof(message: str, attachment_types: list[str], state: int) -> bool:
+def _detect_payment_proof_keyword(message: str, attachment_types: list[str], state: int) -> bool:
     if state != 3:
         return False
-
     normalized_types = {str(t).lower().strip() for t in attachment_types if str(t).strip()}
     has_image = "image" in normalized_types
-
+    if not has_image:
+        return False
     text = message.lower().strip()
     proof_words = ["paid", "payment", "trx", "bkash", "nagad", "rocket", "screenshot", "ss", "proof"]
     mentions_payment = any(w in text for w in proof_words)
-
-    # Accept proof when an image is attached and either:
-    # - text is empty (image-only screenshot), or
-    # - payment-related text is present.
     return has_image and ((not text) or mentions_payment)
 
 
@@ -389,25 +596,21 @@ def notify_owner_order(user_id: str, session: dict[str, Any]) -> None:
         item_lines.append(f"- {item['quantity']} x {item['product']}{color_part}")
 
     notification = (
-        "🚨 NEW ORDER\n"
+        "NEW ORDER\n"
         f"User: {user_id}\n"
         "Items:\n"
-        f"{'\n'.join(item_lines)}\n"
-        f"Total: {session['cart']['total_price']} {PRODUCT['currency']}\n"
-        f"Location: {session.get('location') or 'Not provided'}\n"
-        "Payment: CONFIRMED (recheck manually)\n"
-        f"Delivery: {PRODUCT['delivery']}"
+        + "\n".join(item_lines)
+        + "\n"
+        + f"Total: {session['cart']['total_price']} {PRODUCT['currency']}\n"
+        + f"Location: {session.get('location') or 'Not provided'}\n"
+        + "Payment: CONFIRMED (recheck manually)\n"
+        + f"Delivery: {PRODUCT['delivery']}"
     )
-    print(notification)
+    logger.info(notification)
 
 
 def notify_owner_doubt(user_id: str, text: str) -> None:
-    notification = (
-        "⚠️ CUSTOMER QUESTION\n"
-        f"User: {user_id}\n"
-        f"Message: {text}"
-    )
-    print(notification)
+    logger.info("CUSTOMER QUESTION user=%s text=%s", user_id, text)
 
 
 def handle_message(
@@ -417,7 +620,7 @@ def handle_message(
     payment_proof_detected: bool = False,
 ) -> tuple[str, bool]:
     if session is None:
-        session = user_sessions.setdefault(user_id, _new_session())
+        session = session_cache.setdefault(user_id, _new_session())
 
     intent = intent_data["intent"]
     quantity = intent_data["quantity"]
@@ -442,7 +645,7 @@ def handle_message(
         )
 
         if color is None:
-            reply += " Which color do you want? 😊"
+            reply += " Which color do you want?"
 
         if not session["upsell_used"]:
             allow_upsell = True
@@ -491,7 +694,7 @@ def handle_message(
     ), False
 
 
-def fetch_recent_messages_from_graph(user_id: str, limit: int = 10) -> list[dict[str, Any]]:
+async def fetch_recent_messages_from_graph(user_id: str, limit: int = 10) -> list[dict[str, Any]]:
     if not PAGE_ACCESS_TOKEN or not PAGE_ID:
         return []
 
@@ -502,9 +705,10 @@ def fetch_recent_messages_from_graph(user_id: str, limit: int = 10) -> list[dict
     }
 
     try:
-        response = requests.get(url, params=params, timeout=15)
+        async with httpx.AsyncClient(timeout=20) as client_http:
+            response = await client_http.get(url, params=params)
         if response.status_code >= 400:
-            print(f"[fetch_recent_messages_from_graph] Graph API error: {response.status_code} {response.text}")
+            logger.warning("Graph API history error %s %s", response.status_code, response.text)
             return []
 
         data = response.json()
@@ -538,6 +742,7 @@ def fetch_recent_messages_from_graph(user_id: str, limit: int = 10) -> list[dict
                     "text": text,
                     "attachments_count": len(attachments_raw),
                     "attachment_types": attachment_types,
+                    "attachment_urls": [],
                     "created_time": msg.get("created_time"),
                 }
             )
@@ -545,8 +750,8 @@ def fetch_recent_messages_from_graph(user_id: str, limit: int = 10) -> list[dict
         user_messages.sort(key=lambda m: str(m.get("created_time") or ""))
         return user_messages[-limit:]
 
-    except Exception as exc:
-        print(f"[fetch_recent_messages_from_graph] Exception: {exc}")
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.exception("fetch_recent_messages_from_graph failed: %s", exc)
         return []
 
 
@@ -560,8 +765,8 @@ def rebuild_state_from_history(messages: list[dict[str, Any]]) -> dict[str, Any]
         attachments_count = int(entry.get("attachments_count", 0) or 0)
         attachment_types = [str(t).lower() for t in (entry.get("attachment_types") or [])]
 
-        intent_data = detect_intent(text)
-        payment_proof_detected = _detect_payment_proof(text, attachment_types, rebuilt["state"])
+        intent_data = _detect_intent_sync(text)
+        payment_proof_detected = _detect_payment_proof_keyword(text, attachment_types, rebuilt["state"])
         if payment_proof_detected:
             intent_data["intent"] = "payment"
             intent_data["payment_detected"] = True
@@ -570,6 +775,7 @@ def rebuild_state_from_history(messages: list[dict[str, Any]]) -> dict[str, Any]
             intent_data,
             text,
             attachments_count,
+            attachment_types,
             current_state=rebuilt["state"],
             payment_proof_detected=payment_proof_detected,
         )
@@ -582,17 +788,23 @@ def rebuild_state_from_history(messages: list[dict[str, Any]]) -> dict[str, Any]
     return rebuilt
 
 
-def ensure_user_session(user_id: str) -> dict[str, Any]:
-    existing = user_sessions.get(user_id)
-    if existing is not None:
-        return existing
+async def ensure_user_session(user_id: str) -> dict[str, Any]:
+    cached = session_cache.get(user_id)
+    if cached is not None:
+        return cached
 
-    history = user_message_history.get(user_id)
+    db_session = await asyncio.to_thread(db_get_session, user_id)
+    if db_session is not None:
+        session_cache[user_id] = db_session
+        return db_session
+
+    history = await asyncio.to_thread(db_recent_history, user_id, 20)
     if not history:
-        history = fetch_recent_messages_from_graph(user_id, limit=10)
+        history = await fetch_recent_messages_from_graph(user_id, limit=10)
 
     rebuilt = rebuild_state_from_history(history or [])
-    user_sessions[user_id] = rebuilt
+    session_cache[user_id] = rebuilt
+    await asyncio.to_thread(db_save_session, user_id, rebuilt)
     return rebuilt
 
 
@@ -600,6 +812,7 @@ def apply_attachment_rules(
     intent_data: dict[str, Any],
     message: str,
     attachments_count: int,
+    attachment_types: list[str],
     current_state: int,
     payment_proof_detected: bool,
 ) -> dict[str, Any]:
@@ -608,49 +821,52 @@ def apply_attachment_rules(
         return result
 
     text = message.strip().lower()
-    base_qty = 0 if not text else int(result.get("quantity", 1))
     current_intent = str(result.get("intent", "unknown")).lower()
+    normalized_types = {str(t).lower().strip() for t in attachment_types if str(t).strip()}
 
-    # If attachment is sent without text, treat each attachment as a product add.
-    if not text:
-        # In payment stage, an image-only message is treated as screenshot proof.
-        if current_state == 3 and payment_proof_detected:
+    if current_state == 3:
+        if payment_proof_detected:
             result["intent"] = "payment"
             result["payment_detected"] = True
-            return result
-
-        result["intent"] = "add_item"
-        result["quantity"] = attachments_count
         return result
 
-    # In payment stage, do not convert arbitrary attachments into new cart items.
-    if current_state == 3 and not payment_proof_detected:
+    if not text:
+        # Only shared post-like attachments imply product add.
+        if "share" in normalized_types:
+            result["intent"] = "add_item"
+            result["quantity"] = max(1, attachments_count)
         return result
 
-    # Keep explicit user intents (payment/location/question/order) when text is clear.
     if current_intent in {"payment", "location", "question", "order"}:
-        result["attachment_items"] = attachments_count
         return result
 
-    # Otherwise, attachment implies product add and should combine with detected quantity.
-    result["intent"] = "add_item"
-    result["quantity"] = max(attachments_count, base_qty + attachments_count if base_qty > 0 else attachments_count)
+    # Text + shared attachment can imply adding product.
+    if "share" in normalized_types and current_intent in {"unknown", "other", "price"}:
+        result["intent"] = "add_item"
+        result["quantity"] = max(1, int(result.get("quantity", 1)))
+
     return result
 
 
-def process_message(
+async def process_message(
     user_id: str,
     message: str,
     attachments_count: int = 0,
     attachment_types: list[str] | None = None,
-    auto_send: bool = False,
-) -> str:
+    attachment_urls: list[str] | None = None,
+) -> tuple[str, bool]:
     attachment_types = [str(t).lower().strip() for t in (attachment_types or [])]
-    session = ensure_user_session(user_id)
+    attachment_urls = [str(u).strip() for u in (attachment_urls or []) if str(u).strip()]
 
-    # 1. Call AI intent detection.
-    intent_data = detect_intent(message)
-    payment_proof_detected = _detect_payment_proof(message, attachment_types, session["state"])
+    session = await ensure_user_session(user_id)
+    previous_state = int(session["state"])
+
+    intent_data = await detect_intent(message)
+
+    payment_proof_detected = _detect_payment_proof_keyword(message, attachment_types, session["state"])
+    if not payment_proof_detected and session["state"] == 3 and attachment_urls:
+        payment_proof_detected = await analyze_payment_images(attachment_types, attachment_urls, message, session["state"])
+
     if payment_proof_detected:
         intent_data["intent"] = "payment"
         intent_data["payment_detected"] = True
@@ -659,6 +875,7 @@ def process_message(
         intent_data,
         message,
         attachments_count,
+        attachment_types,
         current_state=session["state"],
         payment_proof_detected=payment_proof_detected,
     )
@@ -668,53 +885,30 @@ def process_message(
         intent_data["intent"] = "price"
         intent_data["is_question"] = False
 
-    # 2. Extract structured fields.
     intent = intent_data["intent"]
-    quantity = intent_data["quantity"]
-    color = intent_data["color"]
-    location = intent_data["location"]
     payment_detected = intent_data["payment_detected"]
     is_question = intent_data["is_question"]
-    _ = (intent, quantity, color, location)
 
-    previous_state = session["state"]
-
-    # 4. Early handling for doubts/questions.
     if is_question:
         notify_owner_doubt(user_id, message)
-        final_question_reply = rewrite_reply("I'll confirm and let you know shortly 😊", allow_upsell=False)
-        if auto_send:
-            time.sleep(5)
-            send_message(user_id, final_question_reply)
-        return final_question_reply
+        final_question_reply = await rewrite_reply("I'll confirm and let you know shortly", allow_upsell=False)
+        return final_question_reply, False
 
-    # Price bargaining should not modify cart/state.
     if price_argument:
-        ornament_name = _extract_ornament_name(message)
-        compliment = None
-        if ornament_name and ornament_name in ORNAMENT_COMPLIMENTS:
-            compliment = ORNAMENT_COMPLIMENTS[ornament_name]
-
         bargaining_capped = _register_bargain_and_is_capped(session)
         fixed_price_reply = (
-            f"I totally understand apu 💛 but price fixed at {PRODUCT['price']} {PRODUCT['currency']}. "
+            f"I totally understand apu but price fixed at {PRODUCT['price']} {PRODUCT['currency']}. "
             "Ami best quality maintain kortesi, tai price change kora possible na."
         )
         if bargaining_capped:
             fixed_price_reply = (
-                f"Apu bujhte parchi 💛 price fixed {PRODUCT['price']} {PRODUCT['currency']} and eta ar change kora possible na. "
+                f"Apu bujhte parchi, price fixed {PRODUCT['price']} {PRODUCT['currency']} and eta ar change kora possible na. "
                 "Chaile ami order ta confirm kore dei now."
             )
-        if compliment:
-            fixed_price_reply += f" Ar honestly {compliment}."
+        final_price_reply = await rewrite_reply(fixed_price_reply, allow_upsell=False)
+        await asyncio.to_thread(db_save_session, user_id, session)
+        return final_price_reply, False
 
-        final_price_reply = rewrite_reply(fixed_price_reply, allow_upsell=False)
-        if auto_send:
-            time.sleep(5)
-            send_message(user_id, final_price_reply)
-        return final_price_reply
-
-    # 3. Backend logic from structured data.
     reply, allow_upsell = handle_message(
         user_id,
         intent_data,
@@ -736,23 +930,23 @@ def process_message(
         reply = _super_confused_reply()
         allow_upsell = False
 
-    # 5. Notify owner when payment is detected in state 3.
     if payment_detected and payment_proof_detected and previous_state == 3:
         notify_owner_order(user_id, session)
 
-    # 6. Rewrite reply for style.
-    final_reply = rewrite_reply(reply, allow_upsell)
+    final_reply = await rewrite_reply(reply, allow_upsell)
 
-    # Optional send for webhook pipeline.
-    if auto_send:
-        time.sleep(5)
-        send_message(user_id, final_reply)
-
-    # 7. Return final text.
-    return final_reply
+    await asyncio.to_thread(db_save_session, user_id, session)
+    return final_reply, True
 
 
-def send_message(user_id: str, text: str) -> dict[str, Any]:
+async def send_message(user_id: str, text: str) -> dict[str, Any]:
+    if not PAGE_ACCESS_TOKEN or not PAGE_ID:
+        logger.warning("send_message skipped, token/page not configured")
+        return {"ok": False, "error": "Missing PAGE_ACCESS_TOKEN or PAGE_ID"}
+
+    if MESSAGE_SEND_DELAY_SECONDS > 0:
+        await asyncio.sleep(MESSAGE_SEND_DELAY_SECONDS)
+
     url = f"https://graph.facebook.com/v18.0/{PAGE_ID}/messages"
     payload = {
         "recipient": {"id": user_id},
@@ -761,13 +955,14 @@ def send_message(user_id: str, text: str) -> dict[str, Any]:
     params = {"access_token": PAGE_ACCESS_TOKEN}
 
     try:
-        response = requests.post(url, params=params, json=payload, timeout=20)
+        async with httpx.AsyncClient(timeout=20) as client_http:
+            response = await client_http.post(url, params=params, json=payload)
         if response.status_code >= 400:
-            print(f"[send_message] Graph API error for user {user_id}: {response.status_code} {response.text}")
+            logger.warning("send_message Graph API error user=%s status=%s body=%s", user_id, response.status_code, response.text)
             return {"ok": False, "status_code": response.status_code, "error": response.text}
         return {"ok": True, "data": response.json()}
-    except Exception as exc:
-        print(f"[send_message] Exception for user {user_id}: {exc}")
+    except httpx.HTTPError as exc:
+        logger.exception("send_message HTTP failure user=%s err=%s", user_id, exc)
         return {"ok": False, "error": str(exc)}
 
 
@@ -792,6 +987,24 @@ def _extract_attachment_types(attachments: list[dict[str, Any]]) -> list[str]:
     return [str(att.get("type", "")).lower() for att in attachments if str(att.get("type", "")).strip()]
 
 
+def _extract_attachment_urls(attachments: list[dict[str, Any]]) -> list[str]:
+    urls: list[str] = []
+    for att in attachments:
+        payload = att.get("payload", {}) if isinstance(att, dict) else {}
+        image_obj = payload.get("image", {}) if isinstance(payload.get("image"), dict) else {}
+        candidates = [
+            payload.get("url"),
+            payload.get("src"),
+            image_obj.get("url"),
+            image_obj.get("link"),
+        ]
+        for c in candidates:
+            value = str(c).strip() if c else ""
+            if value and value.startswith("http"):
+                urls.append(value)
+    return urls
+
+
 def _extract_webhook_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
 
@@ -804,6 +1017,7 @@ def _extract_webhook_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
             attachments = message_obj.get("attachments", []) or []
             attachments_count = _count_supported_attachments(attachments)
             attachment_types = _extract_attachment_types(attachments)
+            attachment_urls = _extract_attachment_urls(attachments)
 
             if not user_id:
                 continue
@@ -815,6 +1029,7 @@ def _extract_webhook_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
                         "message": text,
                         "attachments_count": attachments_count,
                         "attachment_types": attachment_types,
+                        "attachment_urls": attachment_urls,
                     }
                 )
 
@@ -827,6 +1042,7 @@ def _extract_webhook_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 attachments = msg.get("attachments", []) or []
                 attachments_count = _count_supported_attachments(attachments)
                 attachment_types = _extract_attachment_types(attachments)
+                attachment_urls = _extract_attachment_urls(attachments)
                 if user_id and (text or attachments_count > 0):
                     events.append(
                         {
@@ -834,10 +1050,34 @@ def _extract_webhook_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
                             "message": text,
                             "attachments_count": attachments_count,
                             "attachment_types": attachment_types,
+                            "attachment_urls": attachment_urls,
                         }
                     )
 
     return events
+
+
+async def process_event(event: dict[str, Any]) -> None:
+    user_id = event["user_id"]
+    message = event["message"]
+    attachments_count = int(event.get("attachments_count", 0))
+    attachment_types = [str(t).lower() for t in (event.get("attachment_types") or [])]
+    attachment_urls = [str(u) for u in (event.get("attachment_urls") or []) if str(u).strip()]
+
+    await append_history(user_id, message, attachments_count, attachment_types, attachment_urls)
+    final_reply, should_send = await process_message(
+        user_id,
+        message,
+        attachments_count=attachments_count,
+        attachment_types=attachment_types,
+        attachment_urls=attachment_urls,
+    )
+    if should_send:
+        await send_message(user_id, final_reply)
+
+
+async def schedule_event_processing(event: dict[str, Any]) -> None:
+    await process_event(event)
 
 
 @app.get("/webhook", response_class=PlainTextResponse)
@@ -852,7 +1092,7 @@ def verify_webhook(
 
 
 @app.post("/webhook")
-async def webhook(request: Request) -> dict[str, Any]:
+async def webhook(request: Request, background_tasks: BackgroundTasks) -> dict[str, Any]:
     raw_body = await request.body()
     signature = request.headers.get("X-Hub-Signature-256")
     if not verify_meta_signature(raw_body, signature):
@@ -860,41 +1100,25 @@ async def webhook(request: Request) -> dict[str, Any]:
 
     try:
         payload = json.loads(raw_body.decode("utf-8"))
-    except Exception as exc:
+    except json.JSONDecodeError as exc:
         raise HTTPException(status_code=400, detail=f"Invalid JSON payload: {exc}") from exc
 
     events = _extract_webhook_events(payload)
-
-    processed = 0
     for event in events:
-        user_id = event["user_id"]
-        message = event["message"]
-        attachments_count = int(event.get("attachments_count", 0))
-        attachment_types = [str(t).lower() for t in (event.get("attachment_types") or [])]
+        background_tasks.add_task(schedule_event_processing, event)
 
-        _append_history(user_id, message, attachments_count, attachment_types)
-        process_message(
-            user_id,
-            message,
-            attachments_count=attachments_count,
-            attachment_types=attachment_types,
-            auto_send=True,
-        )
-        processed += 1
-
-    return {"status": "ok", "processed": processed}
+    return {"status": "ok", "queued": len(events)}
 
 
 @app.post("/test")
-def test_endpoint(body: TestRequest) -> dict[str, str]:
-    _append_history(body.user_id, body.message, body.attachments_count, body.attachment_types)
-    time.sleep(5)
-    reply = process_message(
+async def test_endpoint(body: TestRequest) -> dict[str, str]:
+    await append_history(body.user_id, body.message, body.attachments_count, body.attachment_types, body.attachment_urls)
+    reply, _ = await process_message(
         body.user_id,
         body.message,
         attachments_count=body.attachments_count,
         attachment_types=body.attachment_types,
-        auto_send=False,
+        attachment_urls=body.attachment_urls,
     )
     return {"reply": reply}
 
