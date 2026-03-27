@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.git/
+.github/
+.gitignore
+.venv/
+ellenai_state.db
+test_webhook.py
+TEST_GUIDE.md
+.env
+.env.local

@@ -24,6 +24,7 @@ Minimal FastAPI backend that:
 - `POST /test` local simulation endpoint
 - `GET /webhook` Meta verification endpoint
 - `POST /webhook` Meta message event endpoint
+- `POST /admin/reload-products` reload `products.json` without restart (requires `X-Admin-Token`)
 
 ## Install
 
@@ -40,6 +41,21 @@ Copy `.env.example` values into your deployment environment (or set locally in s
 - `PAGE_ID`
 - `VERIFY_TOKEN`
 - `APP_SECRET`
+- `PRODUCTS_FILE_PATH` (optional, default `products.json`)
+- `ADMIN_TOKEN` (required to enable admin reload endpoint)
+
+Optional reliability tuning knobs (recommended for production-like testing):
+
+- `OPENAI_RETRY_ATTEMPTS` (default `3`)
+- `OPENAI_RETRY_MIN_SECONDS` (default `1`)
+- `OPENAI_RETRY_MAX_SECONDS` (default `8`)
+- `INTENT_CACHE_MAX_SIZE` (default `10000`)
+- `REWRITE_CACHE_MAX_SIZE` (default `10000`)
+- `SESSION_CACHE_MAX_SIZE` (default `5000`)
+- `USER_RATE_LIMIT_COUNT` (default `8`)
+- `USER_RATE_LIMIT_WINDOW_SECONDS` (default `20`)
+- `WEBHOOK_RATE_LIMIT_COUNT` (default `60`)
+- `WEBHOOK_RATE_LIMIT_WINDOW_SECONDS` (default `10`)
 
 Local PowerShell example:
 
@@ -49,6 +65,64 @@ $env:PAGE_ACCESS_TOKEN="your_page_access_token"
 $env:PAGE_ID="your_page_id"
 $env:VERIFY_TOKEN="your_verify_token"
 $env:APP_SECRET="your_meta_app_secret"
+$env:PRODUCTS_FILE_PATH="products.json"
+$env:ADMIN_TOKEN="your_strong_admin_token"
+```
+
+## Product Catalog From JSON
+
+Create a `products.json` file (or set `PRODUCTS_FILE_PATH`) using normalized post URLs as keys:
+
+```json
+{
+	"instagram.com/p/ABC123": {
+		"name": "Oversized Hoodie",
+		"price": 2500,
+		"currency": "BDT",
+		"delivery": "3-5 days"
+	},
+	"facebook.com/posts/XYZ456": {
+		"name": "Silver Earrings",
+		"price": 1200,
+		"currency": "BDT",
+		"delivery": "2-4 days"
+	}
+}
+```
+
+Full links are normalized internally by removing protocol (`http://`, `https://`), `www.`, query params, and trailing slash.
+Canonical examples:
+
+- `https://www.instagram.com/p/ABC123/?igsh=xyz` -> `instagram.com/p/ABC123`
+- `https://www.facebook.com/manifesto.ei/posts/123456789` -> `facebook.com/posts/123456789`
+
+When a shared attachment URL normalizes to a key in `products.json`, that product is used automatically.
+If a shared URL is not mapped, bot replies: `This item is not available right now apu 😢`.
+
+Use the simple script `manage_products.py` to add/update products quickly:
+
+```powershell
+python manage_products.py
+```
+
+Or call directly in Python:
+
+```python
+from product_store import add_product
+
+add_product(
+    full_url="https://www.instagram.com/p/ABC123/?igsh=xyz",
+    name="Silver Earrings",
+    price=1200,
+    currency="BDT",
+    delivery="2-4 days",
+)
+```
+
+Reload products without restart:
+
+```powershell
+curl -X POST http://127.0.0.1:8000/admin/reload-products -H "X-Admin-Token: your_strong_admin_token"
 ```
 
 ## Run Locally
@@ -102,6 +176,16 @@ Use attachment types to simulate screenshot proof:
   "message": "",
   "attachments_count": 1,
   "attachment_types": ["image"]
+}
+```
+
+Test product URL detection with `attachment_urls`:
+
+```json
+{
+	"user_id": "123",
+	"message": "",
+	"attachment_urls": ["https://www.instagram.com/p/ABC123/?igsh=xyz"]
 }
 ```
 
@@ -168,3 +252,6 @@ uvicorn main:app --host 0.0.0.0 --port $PORT
 - Graph API limits/rate limits apply; avoid forcing rebuild on every webhook call.
 - Secrets are now read from environment variables; do not hardcode them in source files.
 - If any key was previously exposed in code history, rotate it immediately.
+- Incoming webhook events are persisted before acknowledgment, then processed from SQLite-backed queue records.
+- App startup attempts to recover pending/retry events automatically.
+- Session saves use version-checked updates to reduce stale overwrite risks.
