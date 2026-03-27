@@ -1024,6 +1024,50 @@ def _create_closing_cta(current_state: int, cart_total: int = 0) -> str:
     return "What's next apu? I'm ready to help! 😊"
 
 
+def _get_add_on_suggestion(current_total: int, target_min: int) -> str | None:
+    """Suggest add-ons when approaching minimum order threshold."""
+    if current_total <= 0 or current_total > target_min:
+        return None
+    
+    gap = target_min - current_total
+    if gap > 0:
+        suggestions = _search_catalog_products("accessories new trending", "messenger", limit=2)
+        if suggestions:
+            for _key, prod in suggestions:
+                price = int(prod.get("price") or 0)
+                if 0 < price <= gap + 500:  # Slightly above gap to give options
+                    name = str(prod.get("name", "Item"))
+                    return f"💡 Add '{name}' ({price} tk) & confirm? Perfect combo!"
+    return None
+
+
+def _should_show_urgency_prompt(session: dict[str, Any]) -> bool:
+    """Determine if we should show urgency/scarcity messaging."""
+    # Show urgency if:
+    # - Customer has items in cart (considering buying)
+    # - We haven't already used urgency in this session
+    if not session.get("cart", {}).get("items"):
+        return False
+    return not session.get("_urgency_shown", False)
+
+
+def _mark_urgency_shown(session: dict[str, Any]) -> None:
+    """Mark that we've shown urgency messaging in this session."""
+    session["_urgency_shown"] = True
+
+
+def _get_urgency_message() -> str:
+    """Get a compelling urgency/scarcity message."""
+    messages = [
+        "📊 Most orders ship within 24 hours - order now!",
+        "🔥 Limited pieces remaining in this design!",
+        "⚡ Last chance to grab these bestsellers!",
+        "⏰ Stock moves fast - confirm now apu!",
+    ]
+    import random
+    return random.choice(messages)
+
+
 def db_save_session(user_id: str, session: dict[str, Any]) -> bool:
     return state_store.save_session(user_id, session)
 
@@ -1206,7 +1250,17 @@ def handle_message(
         else:
             reply += f" | {color.upper()} selected"
         
-        reply += f" | {_create_closing_cta(1, cart_total)}"
+        # Add urgency messaging if appropriate
+        if _should_show_urgency_prompt(session):
+            reply += f" | {_get_urgency_message()}"
+            _mark_urgency_shown(session)
+        
+        # Add upsell suggestion if below minimum
+        addon_suggestion = _get_add_on_suggestion(cart_total, MIN_ORDER_TOTAL)
+        if addon_suggestion:
+            reply += f" | {addon_suggestion}"
+        else:
+            reply += f" | {_create_closing_cta(1, cart_total)}"
 
         if not session["upsell_used"]:
             allow_upsell = True
@@ -1224,7 +1278,7 @@ def handle_message(
             session["cart"]["items"][-1]["color"] = color
 
         session["state"] = 2
-        return f"Perfect! 🎯 Just one more step - where should we deliver? Share your full address apu! {_create_closing_cta(2)}", False
+        return f"Excellent! 🎯 We're almost there - just need your delivery address apu! Share it now & we'll process today. {_create_closing_cta(2)}", False
 
     if intent == "location" or (session["state"] == 2 and location):
         if location:
