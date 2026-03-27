@@ -11,11 +11,10 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import PlainTextResponse
+from fastapi import FastAPI, HTTPException
 from openai import APIError, OpenAI
-from pydantic import BaseModel, Field
 from dotenv import load_dotenv
+from ellenai.routes import RouteDeps, build_router
 from ellenai.settings import load_settings
 from ellenai.state_store import StateStore
 from ellenai.task_supervisor import TaskSupervisor
@@ -132,15 +131,6 @@ lock_registry_guard = asyncio.Lock()
 user_rate_buckets: dict[str, deque[float]] = {}
 webhook_rate_bucket: deque[float] = deque()
 rate_limit_guard = asyncio.Lock()
-
-
-class TestRequest(BaseModel):
-    user_id: str
-    message: str
-    source: str = "unknown"
-    attachments_count: int = 0
-    attachment_types: list[str] = Field(default_factory=list)
-    attachment_urls: list[str] = Field(default_factory=list)
 
 
 def log_startup_configuration() -> None:
@@ -1708,90 +1698,37 @@ async def schedule_event_processing_by_ids(event_ids: list[int]) -> None:
         await process_event_by_id(event_id)
 
 
-@app.get("/webhook", response_class=PlainTextResponse)
-def verify_webhook(
-    hub_mode: str | None = Query(default=None, alias="hub.mode"),
-    hub_verify_token: str | None = Query(default=None, alias="hub.verify_token"),
-    hub_challenge: str | None = Query(default=None, alias="hub.challenge"),
-) -> str:
-    if hub_mode == "subscribe" and hub_verify_token == VERIFY_TOKEN and hub_challenge:
-        return hub_challenge
-    raise HTTPException(status_code=403, detail="Verification failed")
+def _verify_signature(raw_body: bytes, signature_header: str | None) -> bool:
+    return verify_meta_signature(raw_body, signature_header, APP_SECRET)
 
 
-@app.post("/webhook")
-async def webhook(request: Request) -> dict[str, Any]:
-    raw_body = await request.body()
-    signature = request.headers.get("X-Hub-Signature-256")
-    logger.info(
-        "WEBHOOK POST received content_length=%s signature_present=%s",
-        len(raw_body),
-        bool(signature),
+def _spawn_processing_by_ids(event_ids: list[int]) -> None:
+    task_supervisor.spawn(schedule_event_processing_by_ids(event_ids))
+
+
+def _products_loaded_count() -> int:
+    return len(PRODUCT_MAP)
+
+
+app.include_router(
+    build_router(
+        RouteDeps(
+            verify_token=VERIFY_TOKEN,
+            admin_token=ADMIN_TOKEN,
+            products_file_path=PRODUCTS_FILE_PATH,
+            logger=logger,
+            verify_signature=_verify_signature,
+            extract_events=extract_webhook_events,
+            allow_webhook_batch=_allow_webhook_batch,
+            insert_event=db_insert_incoming_event,
+            spawn_processing_by_ids=_spawn_processing_by_ids,
+            append_history=append_history,
+            process_message=process_message,
+            reload_products=load_post_product_map,
+            products_loaded=_products_loaded_count,
+        )
     )
-    if not verify_meta_signature(raw_body, signature, APP_SECRET):
-        logger.warning("WEBHOOK POST rejected invalid signature")
-        raise HTTPException(status_code=403, detail="Invalid signature")
-
-    try:
-        payload = json.loads(raw_body.decode("utf-8"))
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid JSON payload: {exc}") from exc
-
-    events = extract_webhook_events(payload)
-    logger.info("WEBHOOK POST parsed events=%s object=%s", len(events), payload.get("object"))
-
-    if not await _allow_webhook_batch(len(events)):
-        logger.warning("WEBHOOK POST rate limited events=%s", len(events))
-        raise HTTPException(status_code=429, detail="Webhook rate limit exceeded")
-
-    # Persist first, then acknowledge webhook to avoid losing tasks on restart.
-    event_ids: list[int] = []
-    for event in events:
-        event_id = await asyncio.to_thread(db_insert_incoming_event, event)
-        event_ids.append(event_id)
-
-    if event_ids:
-        task_supervisor.spawn(schedule_event_processing_by_ids(event_ids))
-
-    logger.info("WEBHOOK POST queued stored=%s", len(event_ids))
-
-    return {"status": "ok", "queued": len(events), "stored": len(event_ids)}
-
-
-@app.post("/test")
-async def test_endpoint(body: TestRequest) -> dict[str, str]:
-    await append_history(body.user_id, body.message, body.attachments_count, body.attachment_types, body.attachment_urls)
-    reply, _ = await process_message(
-        body.user_id,
-        body.message,
-        source=body.source,
-        attachments_count=body.attachments_count,
-        attachment_types=body.attachment_types,
-        attachment_urls=body.attachment_urls,
-    )
-    return {"reply": reply}
-
-
-@app.post("/admin/reload-products")
-async def admin_reload_products(request: Request) -> dict[str, Any]:
-    if not ADMIN_TOKEN:
-        raise HTTPException(status_code=503, detail="Admin endpoint disabled: set ADMIN_TOKEN")
-
-    provided_token = request.headers.get("X-Admin-Token", "")
-    if provided_token != ADMIN_TOKEN:
-        raise HTTPException(status_code=403, detail="Invalid admin token")
-
-    await asyncio.to_thread(load_post_product_map)
-    return {
-        "status": "ok",
-        "products_loaded": len(PRODUCT_MAP),
-        "products_file": str(PRODUCTS_FILE_PATH),
-    }
-
-
-@app.get("/")
-def health() -> dict[str, str]:
-    return {"status": "running"}
+)
 
 
 if __name__ == "__main__":
