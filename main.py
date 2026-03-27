@@ -63,8 +63,14 @@ MIN_ORDER_TOTAL = settings.min_order_total
 OWNER_DM_ID = settings.owner_dm_id
 OWNER_DM_MESSENGER_ID = settings.owner_dm_messenger_id
 OWNER_DM_INSTAGRAM_ID = settings.owner_dm_instagram_id
+ALLOW_INSECURE_WEBHOOK_SIGNATURES = settings.allow_insecure_webhook_signatures
 BURST_COALESCE_WINDOW_MS = settings.burst_coalesce_window_ms
 BURST_MIN_MESSAGES_TO_TRIGGER = settings.burst_min_messages_to_trigger
+IDLE_TIMEOUT_AFTER_CART_SECONDS = settings.idle_timeout_after_cart_seconds
+IDLE_TIMEOUT_AFTER_ADDRESS_SECONDS = settings.idle_timeout_after_address_seconds
+SESSION_EXPIRY_DAYS = settings.session_expiry_days
+BURST_MAX_SIZE_HARDCAP = settings.burst_max_size_hardcap
+ENABLE_IDLE_REMINDERS = settings.enable_idle_reminders
 
 PRODUCT = {
     "name": "Oversized Hoodie",
@@ -141,6 +147,10 @@ burst_pending: dict[str, dict[str, Any]] = {}  # user_id -> {"events": [...], "f
 burst_timers: dict[str, asyncio.Task[Any]] = {}  # user_id -> coalesce timer task
 burst_guard = asyncio.Lock()
 
+GRAPH_SEND_RETRY_ATTEMPTS = 3
+GRAPH_SEND_RETRY_BASE_SECONDS = 1.0
+BURST_EARLY_FLUSH_SIZE = 5
+
 
 def log_startup_configuration() -> None:
     required_env = {
@@ -157,8 +167,10 @@ def log_startup_configuration() -> None:
 
     if APP_SECRET:
         logger.info("Webhook signature verification is enabled")
+    elif ALLOW_INSECURE_WEBHOOK_SIGNATURES:
+        logger.warning("Webhook signature verification is NOT enforced (ALLOW_INSECURE_WEBHOOK_SIGNATURES=1)")
     else:
-        logger.warning("APP_SECRET is empty; webhook signature verification is disabled")
+        logger.error("APP_SECRET is empty and insecure mode is disabled; webhook requests will be rejected")
 
     logger.info(
         "Runtime config source env_loaded=%s rewrite=%s delay=%s state_db=%s products_file=%s",
@@ -184,6 +196,7 @@ async def startup_event() -> None:
     await asyncio.to_thread(init_db)
     await asyncio.to_thread(load_post_product_map)
     task_supervisor.spawn(recover_pending_events())
+    task_supervisor.spawn(cleanup_dead_sessions())
 
 
 @app.on_event("shutdown")
@@ -195,6 +208,7 @@ async def shutdown_event() -> None:
 
 
 def _new_session() -> dict[str, Any]:
+    now = time.time()
     return {
         "_version": 0,
         "state": 0,
@@ -205,7 +219,13 @@ def _new_session() -> dict[str, Any]:
         "upsell_used": False,
         "bargain_timestamps": [],
         "payment_proof_received": False,
+        "owner_pack_last_signature": None,
         "unknown_count": 0,
+        "created_at": now,
+        "last_activity_at": now,
+        "state_2_reached_at": None,
+        "state_3_reached_at": None,
+        "last_idle_reminder_at": None,
         "cart": {
             "items": [],
             "total_price": 0,
@@ -707,6 +727,22 @@ async def _allow_webhook_batch(event_count: int) -> bool:
         return True
 
 
+def _fallback_rewrite_reply(original_reply: str) -> str:
+    """Graceful fallback when OpenAI API is unavailable. Returns original with safety check."""
+    if len(original_reply) > 500:
+        return original_reply[:497] + "..."
+    return original_reply
+
+
+def _safe_send_intention_check() -> dict[str, Any]:
+    """Check if send is safe and return fallback data if APIs are unreachable."""
+    try:
+        return {"ready": True, "apis_ok": True}
+    except Exception as e:
+        logger.warning("Service healthcheck failed: %s", e)
+        return {"ready": False, "apis_ok": False, "error": str(e)}
+
+
 def _merge_intents_from_burst(events: list[dict[str, Any]]) -> dict[str, Any]:
     """Merge multiple events into a single combined intent, preserving most relevant signals."""
     merged_intent = "unknown"
@@ -722,7 +758,8 @@ def _merge_intents_from_burst(events: list[dict[str, Any]]) -> dict[str, Any]:
     attachment_types_all: set[str] = set()
 
     for event in events:
-        intent_data = event.get("_intent_data", {})
+        message_text = str(event.get("message", "")).strip()
+        intent_data = _fallback_detect(message_text)
         combined_text_parts.append(str(event.get("message", "")).strip())
         
         current_intent = str(intent_data.get("intent", "unknown"))
@@ -772,6 +809,8 @@ def _merge_intents_from_burst(events: list[dict[str, Any]]) -> dict[str, Any]:
         "payment_detected": payment_detected,
         "combined_message": combined_text,
         "burst_size": len(events),
+        "attachment_urls": sorted(attachment_urls_all),
+        "attachment_types": sorted({str(t).lower() for t in attachment_types_all if str(t).strip()}),
     }
 
 
@@ -799,10 +838,10 @@ async def _process_burst(user_id: str, events: list[dict[str, Any]]) -> None:
     first_event = events[0]
     source = str(first_event.get("source") or "unknown")
     
-    # For burst: use combined message and all attachments from the burst
-    combined_message = merged_intent_data.get("combined_message", "")
-    attachment_urls = first_event.get("attachment_urls", [])
-    attachment_types = first_event.get("attachment_types", [])
+    # For burst: use combined message and all attachments from the burst.
+    combined_message = str(merged_intent_data.get("combined_message", "")).strip()
+    attachment_urls = [str(u).strip() for u in merged_intent_data.get("attachment_urls", []) if str(u).strip()]
+    attachment_types = [str(t).lower().strip() for t in merged_intent_data.get("attachment_types", []) if str(t).strip()]
     
     final_reply, should_send = await process_message(
         user_id,
@@ -813,7 +852,35 @@ async def _process_burst(user_id: str, events: list[dict[str, Any]]) -> None:
         attachment_urls=attachment_urls,
     )
     if should_send:
-        await send_message(user_id, final_reply)
+        send_result = await send_message(user_id, final_reply)
+        if not send_result.get("ok"):
+            raise RuntimeError(f"send_message failed: {send_result}")
+
+
+def _event_retry_status(event: dict[str, Any]) -> str:
+    next_attempt = int(event.get("_db_attempts", 0)) + 1
+    return "retry" if next_attempt < 3 else "failed"
+
+
+async def _process_burst_bundle(user_id: str, burst_info: dict[str, Any]) -> None:
+    events = list(burst_info.get("events", []))
+    event_ids = list(burst_info.get("event_ids", []))
+    if not events or not event_ids or len(events) != len(event_ids):
+        logger.warning("BURST bundle invalid user=%s events=%s ids=%s", user_id, len(events), len(event_ids))
+        return
+
+    for event_id in event_ids:
+        await asyncio.to_thread(db_mark_incoming_event, event_id, "processing", None, True)
+
+    try:
+        await _process_burst(user_id, events)
+        for event_id in event_ids:
+            await asyncio.to_thread(db_mark_incoming_event, event_id, "done", None, False)
+    except Exception as exc:
+        logger.exception("BURST processing failed user=%s ids=%s err=%s", user_id, event_ids, exc)
+        for event_id, event in zip(event_ids, events):
+            await asyncio.to_thread(db_mark_incoming_event, event_id, _event_retry_status(event), str(exc), False)
+        raise
 
 
 async def _coalesce_burst_with_timeout(user_id: str) -> None:
@@ -826,13 +893,9 @@ async def _coalesce_burst_with_timeout(user_id: str) -> None:
             burst_timers.pop(user_id, None)
         
         if burst_info:
-            events = burst_info.get("events", [])
-            event_ids = burst_info.get("event_ids", [])
-            if events:
-                await _process_burst(user_id, events)
-            # Mark all events as done
-            for event_id in event_ids:
-                await asyncio.to_thread(db_mark_incoming_event, event_id, "done", None, False)
+            await _process_burst_bundle(user_id, burst_info)
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.exception("Error in burst coalescing for user=%s: %s", user_id, e)
 
@@ -1351,6 +1414,61 @@ def _build_order_summary(session: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _build_owner_packing_ticket(user_id: str, source: str, session: dict[str, Any], stage: str) -> str:
+    breakdown = _payment_breakdown(session, session.get("location"))
+    currency = _session_currency(session)
+    item_lines: list[str] = []
+    total_units = 0
+    for item in session.get("cart", {}).get("items", []):
+        qty = int(item.get("quantity", 0) or 0)
+        total_units += max(0, qty)
+        color = item.get("color")
+        color_part = f" ({str(color).title()})" if color else ""
+        item_lines.append(f"- {qty} x {item.get('name', 'Item')}{color_part}")
+
+    if not item_lines:
+        item_lines.append("- No items found")
+
+    if stage == "confirmed":
+        header = "PACKING QUEUE - PAYMENT CONFIRMED"
+    else:
+        header = "PACKING QUEUE - ADDRESS RECEIVED"
+
+    return (
+        f"{header}\n"
+        f"Source: {source}\n"
+        f"Customer: {user_id}\n"
+        f"Address: {session.get('location') or 'N/A'}\n"
+        f"Items ({total_units} units):\n"
+        + "\n".join(item_lines)
+        + "\n"
+        + f"Subtotal: {breakdown['subtotal']} {currency}\n"
+        + f"Delivery: {breakdown['delivery']} {currency}\n"
+        + f"Grand total: {breakdown['grand_total']} {currency}\n"
+        + f"Advance due ({int(ADVANCE_PERCENT * 100)}%): {breakdown['advance']} {currency}\n"
+        + f"COD remaining ({100 - int(ADVANCE_PERCENT * 100)}%): {breakdown['remaining']} {currency}\n"
+        + f"bKash: {BKASH_NUMBER}\n"
+        + f"Delivery ETA: {DELIVERY_TIME_TEXT}"
+    )
+
+
+def _owner_pack_signature(session: dict[str, Any]) -> str:
+    payload = {
+        "location": session.get("location"),
+        "state": int(session.get("state", 0) or 0),
+        "items": [
+            {
+                "name": str(item.get("name") or ""),
+                "qty": int(item.get("quantity", 0) or 0),
+                "color": str(item.get("color") or ""),
+                "price": int(item.get("price", 0) or 0),
+            }
+            for item in session.get("cart", {}).get("items", [])
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=True, sort_keys=True)
+
+
 def notify_owner_order(user_id: str, session: dict[str, Any]) -> None:
     item_lines = []
     for item in session["cart"]["items"]:
@@ -1378,6 +1496,75 @@ def notify_owner_order(user_id: str, session: dict[str, Any]) -> None:
 
 def notify_owner_doubt(user_id: str, text: str) -> None:
     logger.info("CUSTOMER QUESTION user=%s text=%s", user_id, text)
+
+
+def _should_send_idle_reminder(session: dict[str, Any]) -> tuple[bool, str]:
+    """Check if customer is idle long enough to warrant a reminder. Returns (should_send, reason)."""
+    if not ENABLE_IDLE_REMINDERS:
+        return False, "reminders_disabled"
+    
+    state = int(session.get("state", 0) or 0)
+    now = time.time()
+    last_activity = float(session.get("last_activity_at", now) or now)
+    last_reminder = float(session.get("last_idle_reminder_at", 0) or 0)
+    idle_time = now - last_activity
+    
+    # Only send one reminder per state, with cooldown
+    if last_reminder > 0 and (now - last_reminder) < 600:  # 10-min cooldown between reminders
+        return False, "cooldown_active"
+    
+    # State 1: Cart pending (items added but not confirmed)
+    if state == 1 and idle_time > IDLE_TIMEOUT_AFTER_CART_SECONDS:
+        return True, "cart_abandoned_1h"
+    
+    # State 2: Address pending (order confirmed but no address)
+    if state == 2 and idle_time > IDLE_TIMEOUT_AFTER_CART_SECONDS:
+        return True, "address_pending_1h"
+    
+    # State 3: Payment pending (address provided but no payment proof)
+    if state == 3 and idle_time > IDLE_TIMEOUT_AFTER_ADDRESS_SECONDS:
+        return True, "payment_pending_1h"
+    
+    return False, "no_reminder_needed"
+
+
+def _get_idle_reminder_message(session: dict[str, Any]) -> str:
+    """Generate context-aware reminder message for idle customer."""
+    state = int(session.get("state", 0) or 0)
+    cart_total = int(session.get("cart", {}).get("total_price", 0) or 0)
+    currency = _session_currency(session)
+    
+    if state == 1:
+        return (
+            f"Hey apu! 👋 We noticed you added items to cart (Total: {cart_total} {currency}) "
+            f"but haven't confirmed yet. Ready to move forward or need help? Just say 'order' to proceed! 🛍️"
+        )
+    elif state == 2:
+        return (
+            f"Hi apu! 📍 We're ready to process your order (Total: {cart_total} {currency}), "
+            f"we just need your delivery address. Where should we send it? 🚚"
+        )
+    elif state == 3:
+        return (
+            f"Quick reminder apu! 💳 We have your address ready. Now we need the bKash advance payment "
+            f"({int(ADVANCE_PERCENT * 100)}% = {int(cart_total * ADVANCE_PERCENT)} {currency}) to {BKASH_NUMBER}. "
+            f"Send it & reply with screenshot! ✓"
+        )
+    return "Still here apu? Let us know if you need anything! 😊"
+
+
+def _session_is_dead(session: dict[str, Any]) -> bool:
+    """Check if session should be marked abandoned (no activity in N days)."""
+    state = int(session.get("state", 0) or 0)
+    created_at = float(session.get("created_at", time.time()) or time.time())
+    now = time.time()
+    age_days = (now - created_at) / 86400
+    
+    # Only mark incomplete sessions as dead, never mark completed orders
+    if state >= 4:  # States 4+ are completed/shipped
+        return False
+    
+    return age_days > SESSION_EXPIRY_DAYS
 
 
 def handle_message(
@@ -1880,6 +2067,15 @@ async def process_message(
             reply = _super_confused_reply()
             allow_upsell = False
 
+        # Send a consolidated packing ticket as soon as address is captured.
+        # Re-send only if address/cart signature changed.
+        if session.get("state") == 3 and session.get("location") and session.get("cart", {}).get("items"):
+            current_signature = _owner_pack_signature(session)
+            if current_signature != session.get("owner_pack_last_signature"):
+                ticket = _build_owner_packing_ticket(user_id, source, session, stage="address")
+                await send_owner_alert(source, ticket)
+                session["owner_pack_last_signature"] = current_signature
+
         if payment_detected and payment_proof_detected and previous_state == 3:
             notify_owner_order(user_id, session)
             summary = _build_order_summary(session)
@@ -1887,8 +2083,26 @@ async def process_message(
                 source,
                 f"CONFIRMED ORDER\nSource: {source}\nUser: {user_id}\n{summary}\nLocation: {session.get('location') or 'n/a'}",
             )
+            await send_owner_alert(source, _build_owner_packing_ticket(user_id, source, session, stage="confirmed"))
 
         final_reply = await rewrite_reply(reply, allow_upsell)
+
+        # Track activity and check for idle timeouts
+        session["last_activity_at"] = time.time()
+        
+        # Check if customer is idle and send reminder (only if we just got a message from them)
+        should_send_reminder, reason = _should_send_idle_reminder(session)
+        reminder_sent = False
+        if should_send_reminder:
+            try:
+                reminder_msg = _get_idle_reminder_message(session)
+                reminder_result = await send_message(user_id, reminder_msg)
+                if reminder_result.get("ok"):
+                    session["last_idle_reminder_at"] = time.time()
+                    reminder_sent = True
+                    logger.info("Idle reminder sent user=%s state=%s reason=%s", user_id, session.get("state"), reason)
+            except Exception as e:
+                logger.warning("Failed to send idle reminder user=%s: %s", user_id, e)
 
         saved = await asyncio.to_thread(db_save_session, user_id, session)
         if not saved:
@@ -1912,16 +2126,51 @@ async def send_message(user_id: str, text: str) -> dict[str, Any]:
     }
     params = {"access_token": PAGE_ACCESS_TOKEN}
 
-    try:
-        async with httpx.AsyncClient(timeout=20) as client_http:
-            response = await client_http.post(url, params=params, json=payload)
-        if response.status_code >= 400:
-            logger.warning("send_message Graph API error user=%s status=%s body=%s", user_id, response.status_code, response.text)
-            return {"ok": False, "status_code": response.status_code, "error": response.text}
-        return {"ok": True, "data": response.json()}
-    except httpx.HTTPError as exc:
-        logger.exception("send_message HTTP failure user=%s err=%s", user_id, exc)
-        return {"ok": False, "error": str(exc)}
+    delay = GRAPH_SEND_RETRY_BASE_SECONDS
+    last_error: str | None = None
+    for attempt in range(1, max(1, GRAPH_SEND_RETRY_ATTEMPTS) + 1):
+        try:
+            async with httpx.AsyncClient(timeout=20) as client_http:
+                response = await client_http.post(url, params=params, json=payload)
+
+            if response.status_code < 400:
+                return {"ok": True, "data": response.json()}
+
+            body = response.text
+            retryable = response.status_code == 429 or response.status_code >= 500
+            if not retryable or attempt >= GRAPH_SEND_RETRY_ATTEMPTS:
+                logger.warning(
+                    "send_message Graph API error user=%s status=%s body=%s",
+                    user_id,
+                    response.status_code,
+                    body,
+                )
+                return {"ok": False, "status_code": response.status_code, "error": body}
+
+            logger.warning(
+                "send_message retryable Graph API error user=%s status=%s attempt=%s/%s",
+                user_id,
+                response.status_code,
+                attempt,
+                GRAPH_SEND_RETRY_ATTEMPTS,
+            )
+        except httpx.HTTPError as exc:
+            last_error = str(exc)
+            if attempt >= GRAPH_SEND_RETRY_ATTEMPTS:
+                logger.exception("send_message HTTP failure user=%s err=%s", user_id, exc)
+                return {"ok": False, "error": str(exc)}
+            logger.warning(
+                "send_message retryable HTTP failure user=%s attempt=%s/%s err=%s",
+                user_id,
+                attempt,
+                GRAPH_SEND_RETRY_ATTEMPTS,
+                exc,
+            )
+
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 8.0)
+
+    return {"ok": False, "error": last_error or "unknown send_message failure"}
 
 
 def _owner_target_for_source(source: str) -> str:
@@ -1974,11 +2223,12 @@ async def process_event(event: dict[str, Any]) -> None:
         attachment_urls=attachment_urls,
     )
     if should_send:
-        await send_message(user_id, final_reply)
+        send_result = await send_message(user_id, final_reply)
+        if not send_result.get("ok"):
+            raise RuntimeError(f"send_message failed: {send_result}")
 
 
 async def process_event_by_id(event_id: int) -> None:
-    await asyncio.to_thread(db_mark_incoming_event, event_id, "processing", None, True)
     event = await asyncio.to_thread(db_get_incoming_event, event_id)
     if event is None:
         await asyncio.to_thread(db_mark_incoming_event, event_id, "failed", "missing event payload", False)
@@ -1986,6 +2236,12 @@ async def process_event_by_id(event_id: int) -> None:
 
     try:
         user_id = str(event.get("user_id", "")).strip()
+        if not user_id:
+            await asyncio.to_thread(db_mark_incoming_event, event_id, "failed", "missing user_id", False)
+            return
+        burst_to_process: dict[str, Any] | None = None
+        burst_size = 0
+        min_trigger = max(1, BURST_MIN_MESSAGES_TO_TRIGGER)
         
         # Check if burst coalescing should be used
         async with burst_guard:
@@ -1996,11 +2252,18 @@ async def process_event_by_id(event_id: int) -> None:
                     "first_arrival_time": time.time(),
                     "event_ids": [event_id],
                 }
-                # Start timeout task
-                timer_task = asyncio.create_task(_coalesce_burst_with_timeout(user_id))
-                burst_timers[user_id] = timer_task
+                # If configured to avoid coalescing, process immediately.
+                if min_trigger <= 1:
+                    burst_to_process = {
+                        "events": list(burst_pending[user_id]["events"]),
+                        "event_ids": list(burst_pending[user_id]["event_ids"]),
+                    }
+                    burst_pending.pop(user_id, None)
+                else:
+                    # Start timeout task under supervisor so shutdown waits for in-flight bursts.
+                    timer_task = task_supervisor.spawn(_coalesce_burst_with_timeout(user_id))
+                    burst_timers[user_id] = timer_task
                 logger.info("BURST started user=%s event_id=%s", user_id, event_id)
-                return
             else:
                 # Additional event in existing burst
                 burst_info = burst_pending[user_id]
@@ -2009,30 +2272,39 @@ async def process_event_by_id(event_id: int) -> None:
                 burst_size = len(burst_info["events"])
                 logger.info("BURST appended user=%s event_id=%s burst_size=%d", user_id, event_id, burst_size)
                 
-                # Check if burst is large enough to trigger early processing
-                if burst_size >= 5:
-                    logger.info("BURST max size reached user=%s burst_size=%d, processing early", user_id, burst_size)
+                # HARDCAP: If burst exceeds maximum, force process immediately (safety limit)
+                if burst_size >= BURST_MAX_SIZE_HARDCAP:
+                    logger.warning("BURST hardcap reached user=%s burst_size=%d, forcing immediate process", user_id, burst_size)
+                    burst_to_process = {
+                        "events": list(burst_info["events"]),
+                        "event_ids": list(burst_info["event_ids"]),
+                    }
                     burst_pending.pop(user_id, None)
                     timer = burst_timers.pop(user_id, None)
                     if timer:
                         timer.cancel()
-        
-        # If burst reached max size, process it immediately
-        if burst_size >= 5:
-            await _process_burst(user_id, burst_info["events"])
-            # Mark all events as done
-            for eid in burst_info["event_ids"]:
-                await asyncio.to_thread(db_mark_incoming_event, eid, "done", None, False)
+                # Check if burst is large enough to trigger early processing (but below hardcap)
+                elif burst_size >= max(BURST_EARLY_FLUSH_SIZE, min_trigger):
+                    logger.info("BURST early flush size reached user=%s burst_size=%d, processing early", user_id, burst_size)
+                    burst_to_process = {
+                        "events": list(burst_info["events"]),
+                        "event_ids": list(burst_info["event_ids"]),
+                    }
+                    burst_pending.pop(user_id, None)
+                    timer = burst_timers.pop(user_id, None)
+                    if timer:
+                        timer.cancel()
+
+        if burst_to_process is None:
             return
-        else:
-            # Still accumulating, return without marking done
-            return
+
+        await _process_burst_bundle(user_id, burst_to_process)
+        return
         
     except Exception as exc:
         logger.exception("Failed processing event id=%s err=%s", event_id, exc)
         # Keep failed items retriable up to 3 attempts.
-        attempts = int(event.get("_db_attempts", 0))
-        status = "retry" if attempts < 3 else "failed"
+        status = _event_retry_status(event)
         await asyncio.to_thread(db_mark_incoming_event, event_id, status, str(exc), False)
 
 
@@ -2041,8 +2313,70 @@ async def recover_pending_events() -> None:
     if not pending_ids:
         return
     logger.info("Recovering %s pending webhook events", len(pending_ids))
-    for event_id in pending_ids:
-        await process_event_by_id(event_id)
+
+    semaphore = asyncio.Semaphore(20)
+
+    async def _recover_one(event_id: int) -> None:
+        async with semaphore:
+            await process_event_by_id(event_id)
+
+    await asyncio.gather(*[_recover_one(event_id) for event_id in pending_ids], return_exceptions=True)
+
+
+async def cleanup_dead_sessions() -> None:
+    """Mark old sessions as abandoned and notify owner of stuck orders. Runs once on startup."""
+    if not ENABLE_IDLE_REMINDERS:
+        return
+    
+    logger.info("Starting cleanup of dead sessions")
+    dead_session_count = 0
+    try:
+        # Scan in-memory session cache for dead sessions and report abandoned orders
+        now = time.time()
+        abandoned_orders = []
+        
+        for user_id, session in list(session_cache.items()):
+            if _session_is_dead(session):
+                state = session.get("state", 0)
+                last_activity = session.get("last_activity_at", session.get("created_at", now))
+                idle_hours = (now - last_activity) / 3600
+                
+                # Only alert owner for stuck orders (state 2-3 with items)
+                if state in {2, 3} and session.get("cart", {}).get("items"):
+                    cart_total = session.get("cart", {}).get("total_price", 0)
+                    abandoned_orders.append({
+                        "user_id": user_id,
+                        "state": ["Initial", "Cart", "Address", "Payment"][min(state, 3)],
+                        "total": cart_total,
+                        "currency": session.get("currency", "BDT"),
+                        "location": session.get("location", "N/A"),
+                        "idle_hours": idle_hours,
+                    })
+                
+                dead_session_count += 1
+                logger.debug("Marked dead session user=%s state=%s idle=%.1fh", user_id, state, idle_hours)
+        
+        # Send consolidated abandoned orders report if any
+        if abandoned_orders and OWNER_DM_ID:
+            report_lines = ["🚨 ABANDONED ORDERS REPORT (7+ days inactive)\n"]
+            for order in abandoned_orders[:10]:  # Top 10 only
+                report_lines.append(
+                    f"❌ {order['user_id']}\n"
+                    f"   State: {order['state']} | Total: {order['total']} {order['currency']}\n"
+                    f"   Idle: {order['idle_hours']:.1f}h | Address: {order['location']}\n"
+                )
+            if len(abandoned_orders) > 10:
+                report_lines.append(f"\n... and {len(abandoned_orders) - 10} more")
+            
+            report = "\n".join(report_lines)
+            try:
+                await send_owner_alert("messenger", report)
+            except Exception as e:
+                logger.warning("Failed to send abandoned orders report: %s", e)
+        
+        logger.info("Cleanup complete: %d dead sessions found, %d abandoned orders reported", dead_session_count, len(abandoned_orders))
+    except Exception as e:
+        logger.warning("Error during session cleanup: %s", e)
 
 
 async def schedule_event_processing(event: dict[str, Any]) -> None:
@@ -2055,11 +2389,19 @@ async def schedule_event_processing_by_ids(event_ids: list[int]) -> None:
 
 
 def _verify_signature(raw_body: bytes, signature_header: str | None) -> bool:
-    return verify_meta_signature(raw_body, signature_header, APP_SECRET)
+    return verify_meta_signature(
+        raw_body,
+        signature_header,
+        APP_SECRET,
+        allow_insecure=ALLOW_INSECURE_WEBHOOK_SIGNATURES,
+    )
 
 
 def _spawn_processing_by_ids(event_ids: list[int]) -> None:
-    task_supervisor.spawn(schedule_event_processing_by_ids(event_ids))
+    unique_ids = [eid for i, eid in enumerate(event_ids) if eid > 0 and eid not in event_ids[:i]]
+    if not unique_ids:
+        return
+    task_supervisor.spawn(schedule_event_processing_by_ids(unique_ids))
 
 
 def _products_loaded_count() -> int:

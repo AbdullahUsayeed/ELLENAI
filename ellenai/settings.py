@@ -35,8 +35,14 @@ class Settings:
     owner_dm_id: str
     owner_dm_messenger_id: str
     owner_dm_instagram_id: str
+    allow_insecure_webhook_signatures: bool
     burst_coalesce_window_ms: int
     burst_min_messages_to_trigger: int
+    idle_timeout_after_cart_seconds: int
+    idle_timeout_after_address_seconds: int
+    session_expiry_days: int
+    burst_max_size_hardcap: int
+    enable_idle_reminders: bool
 
 
 def load_settings() -> Settings:
@@ -69,6 +75,12 @@ def load_settings() -> Settings:
         owner_dm_id=os.getenv("OWNER_DM_ID", ""),
         owner_dm_messenger_id=os.getenv("OWNER_DM_MESSENGER_ID", ""),
         owner_dm_instagram_id=os.getenv("OWNER_DM_INSTAGRAM_ID", ""),
+        allow_insecure_webhook_signatures=os.getenv("ALLOW_INSECURE_WEBHOOK_SIGNATURES", "0") == "1",
         burst_coalesce_window_ms=int(os.getenv("BURST_COALESCE_WINDOW_MS", "2000")),
         burst_min_messages_to_trigger=int(os.getenv("BURST_MIN_MESSAGES_TO_TRIGGER", "2")),
+        idle_timeout_after_cart_seconds=int(os.getenv("IDLE_TIMEOUT_AFTER_CART_SECONDS", "3600")),
+        idle_timeout_after_address_seconds=int(os.getenv("IDLE_TIMEOUT_AFTER_ADDRESS_SECONDS", "3600")),
+        session_expiry_days=int(os.getenv("SESSION_EXPIRY_DAYS", "7")),
+        burst_max_size_hardcap=int(os.getenv("BURST_MAX_SIZE_HARDCAP", "20")),
+        enable_idle_reminders=os.getenv("ENABLE_IDLE_REMINDERS", "1") == "1",
     )

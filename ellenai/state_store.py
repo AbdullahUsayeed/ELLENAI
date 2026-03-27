@@ -49,6 +49,7 @@ class StateStore:
                 """
                 CREATE TABLE IF NOT EXISTS incoming_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    external_event_id TEXT,
                     user_id TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
                     status TEXT NOT NULL,
@@ -59,7 +60,17 @@ class StateStore:
                 )
                 """
             )
+            incoming_cols = {row[1] for row in conn.execute("PRAGMA table_info(incoming_events)").fetchall()}
+            if "external_event_id" not in incoming_cols:
+                conn.execute("ALTER TABLE incoming_events ADD COLUMN external_event_id TEXT")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_incoming_events_status ON incoming_events(status)")
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_incoming_events_external_id
+                ON incoming_events(external_event_id)
+                WHERE external_event_id IS NOT NULL
+                """
+            )
 
     def save_session(self, user_id: str, session: dict[str, Any]) -> bool:
         session_payload = {k: v for k, v in session.items() if k != "_version"}
@@ -106,17 +117,29 @@ class StateStore:
 
     def insert_incoming_event(self, event: dict[str, Any]) -> int:
         user_id = str(event.get("user_id", "")).strip()
+        external_event_id = str(event.get("external_event_id") or "").strip() or None
         payload = json.dumps(event, ensure_ascii=True)
         now_iso = self._utc_now_iso()
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute(
                 """
-                INSERT INTO incoming_events(user_id, payload_json, status, attempts, last_error, created_at, updated_at)
-                VALUES (?, ?, 'pending', 0, NULL, ?, ?)
+                INSERT OR IGNORE INTO incoming_events(
+                    external_event_id, user_id, payload_json, status, attempts, last_error, created_at, updated_at
+                )
+                VALUES (?, ?, ?, 'pending', 0, NULL, ?, ?)
                 """,
-                (user_id, payload, now_iso, now_iso),
+                (external_event_id, user_id, payload, now_iso, now_iso),
             )
-            return int(cursor.lastrowid)
+            if cursor.rowcount == 1:
+                return int(cursor.lastrowid)
+            if external_event_id:
+                existing = conn.execute(
+                    "SELECT id FROM incoming_events WHERE external_event_id = ?",
+                    (external_event_id,),
+                ).fetchone()
+                if existing is not None:
+                    return 0
+            return 0
 
     def get_incoming_event(self, event_id: int) -> dict[str, Any] | None:
         with sqlite3.connect(self.db_path) as conn:
@@ -167,7 +190,7 @@ class StateStore:
                 """
                 SELECT id
                 FROM incoming_events
-                WHERE status IN ('pending', 'retry')
+                WHERE status IN ('pending', 'retry', 'processing')
                 ORDER BY id ASC
                 LIMIT ?
                 """,

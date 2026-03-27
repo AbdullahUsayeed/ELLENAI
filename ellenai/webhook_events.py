@@ -5,10 +5,14 @@ import hmac
 from typing import Any
 
 
-def verify_meta_signature(raw_body: bytes, signature_header: str | None, app_secret: str) -> bool:
+def verify_meta_signature(
+    raw_body: bytes,
+    signature_header: str | None,
+    app_secret: str,
+    allow_insecure: bool = False,
+) -> bool:
     if not app_secret:
-        # Allow local development when secret is not configured.
-        return True
+        return allow_insecure
 
     if not signature_header or not signature_header.startswith("sha256="):
         return False
@@ -66,6 +70,7 @@ def extract_webhook_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
             if user_id and (text or attachments_count > 0):
                 events.append(
                     {
+                        "external_event_id": str(message_obj.get("mid") or "").strip() or None,
                         "user_id": user_id,
                         "source": "messenger",
                         "message": text,
@@ -89,6 +94,7 @@ def extract_webhook_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 if user_id and (text or attachments_count > 0):
                     events.append(
                         {
+                            "external_event_id": str(msg.get("id") or "").strip() or None,
                             "user_id": user_id,
                             "source": source,
                             "message": text,
