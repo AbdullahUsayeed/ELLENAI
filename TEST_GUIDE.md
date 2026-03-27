@@ -15,12 +15,17 @@ python main.py
 ```
 Wait for message: `Uvicorn running on http://0.0.0.0:8000`
 
-### Step 3: Run Tests in Another Terminal
+### Step 3: Run Local Tests in Another Terminal
 ```powershell
-cd e:\Startupt\EllenAI
+Set-Location e:\Startupt\EllenAI
 python test_webhook.py
 ```
 The script will guide you through each test interactively.
+It now uses `POST /test`, so local development does not depend on Meta webhook signatures.
+
+### Step 4: Test Real Meta Delivery Separately
+- Use Messenger or Instagram to send a real message to the deployed bot.
+- Watch Railway logs for `WEBHOOK POST received` lines.
 
 ---
 
@@ -76,7 +81,7 @@ OWNER_DM_INSTAGRAM_ID=987654321   ← Your test owner ID
 
 | Issue | Solution |
 |-------|----------|
-| Connection refused | Bot not running. Start with `python main.py` |
+| Connection refused | Bot not running. Start with `python main.py` or `uvicorn main:app --host 0.0.0.0 --port 8000` |
 | No owner alerts | Owner IDs not set in `.env` |
 | Wrong links returned | Platform detection issue - check source field |
 | Product not found | Keyword doesn't match catalog |

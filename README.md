@@ -32,6 +32,8 @@ Minimal FastAPI backend that:
 pip install -r requirements.txt
 ```
 
+Local `.env` values are loaded automatically on startup.
+
 ## Configure Environment Variables
 
 Copy `.env.example` values into your deployment environment (or set locally in shell):
@@ -71,22 +73,26 @@ $env:ADMIN_TOKEN="your_strong_admin_token"
 
 ## Product Catalog From JSON
 
-Create a `products.json` file (or set `PRODUCTS_FILE_PATH`) using normalized post URLs as keys:
+Create a `products.json` file (or set `PRODUCTS_FILE_PATH`) using normalized post URLs as keys and a list of variants as the value:
 
 ```json
 {
-	"instagram.com/p/ABC123": {
-		"name": "Oversized Hoodie",
-		"price": 2500,
-		"currency": "BDT",
-		"delivery": "3-5 days"
-	},
-	"facebook.com/posts/XYZ456": {
-		"name": "Silver Earrings",
-		"price": 1200,
-		"currency": "BDT",
-		"delivery": "2-4 days"
-	}
+	"instagram.com/p/ABC123": [
+		{
+			"name": "Oversized Hoodie",
+			"price": 2500,
+			"currency": "BDT",
+			"delivery": "3-5 days"
+		}
+	],
+	"facebook.com/posts/XYZ456": [
+		{
+			"name": "Silver Earrings",
+			"price": 1200,
+			"currency": "BDT",
+			"delivery": "2-4 days"
+		}
+	]
 }
 ```
 
@@ -135,6 +141,16 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
 ```powershell
 curl -X POST http://127.0.0.1:8000/test -H "Content-Type: application/json" -d '{"user_id":"123","message":"I want 2 black hoodies"}'
+```
+
+Use `source` in `/test` to simulate Messenger vs Instagram behavior locally:
+
+```json
+{
+	"user_id": "123",
+	"source": "messenger",
+	"message": "nosepin collection dekhan"
+}
 ```
 
 ## Meta Setup Notes

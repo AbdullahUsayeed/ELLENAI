@@ -19,6 +19,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 from openai import APIError, OpenAI
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
 from product_store import load_products, normalize_product_url
 
 
@@ -27,6 +28,8 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 logger = logging.getLogger("ellenai")
+
+load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN", "")
@@ -132,9 +135,38 @@ rate_limit_guard = asyncio.Lock()
 class TestRequest(BaseModel):
     user_id: str
     message: str
+    source: str = "unknown"
     attachments_count: int = 0
     attachment_types: list[str] = Field(default_factory=list)
     attachment_urls: list[str] = Field(default_factory=list)
+
+
+def log_startup_configuration() -> None:
+    required_env = {
+        "OPENAI_API_KEY": OPENAI_API_KEY,
+        "PAGE_ACCESS_TOKEN": PAGE_ACCESS_TOKEN,
+        "PAGE_ID": PAGE_ID,
+        "VERIFY_TOKEN": VERIFY_TOKEN,
+    }
+    missing = [key for key, value in required_env.items() if not str(value).strip()]
+    if missing:
+        logger.warning("Missing required environment values: %s", ", ".join(missing))
+    else:
+        logger.info("Required environment values present: %s", ", ".join(required_env.keys()))
+
+    if APP_SECRET:
+        logger.info("Webhook signature verification is enabled")
+    else:
+        logger.warning("APP_SECRET is empty; webhook signature verification is disabled")
+
+    logger.info(
+        "Runtime config source env_loaded=%s rewrite=%s delay=%s state_db=%s products_file=%s",
+        Path(".env").exists(),
+        ENABLE_REPLY_REWRITE,
+        MESSAGE_SEND_DELAY_SECONDS,
+        STATE_DB_PATH,
+        PRODUCTS_FILE_PATH,
+    )
 
 
 def _utc_now_iso() -> str:
@@ -191,6 +223,7 @@ def init_db() -> None:
 
 @app.on_event("startup")
 async def startup_event() -> None:
+    log_startup_configuration()
     await asyncio.to_thread(init_db)
     await asyncio.to_thread(load_post_product_map)
     asyncio.create_task(recover_pending_events())
@@ -1937,7 +1970,13 @@ def verify_webhook(
 async def webhook(request: Request, background_tasks: BackgroundTasks) -> dict[str, Any]:
     raw_body = await request.body()
     signature = request.headers.get("X-Hub-Signature-256")
+    logger.info(
+        "WEBHOOK POST received content_length=%s signature_present=%s",
+        len(raw_body),
+        bool(signature),
+    )
     if not verify_meta_signature(raw_body, signature):
+        logger.warning("WEBHOOK POST rejected invalid signature")
         raise HTTPException(status_code=403, detail="Invalid signature")
 
     try:
@@ -1946,8 +1985,10 @@ async def webhook(request: Request, background_tasks: BackgroundTasks) -> dict[s
         raise HTTPException(status_code=400, detail=f"Invalid JSON payload: {exc}") from exc
 
     events = _extract_webhook_events(payload)
+    logger.info("WEBHOOK POST parsed events=%s object=%s", len(events), payload.get("object"))
 
     if not await _allow_webhook_batch(len(events)):
+        logger.warning("WEBHOOK POST rate limited events=%s", len(events))
         raise HTTPException(status_code=429, detail="Webhook rate limit exceeded")
 
     # Persist first, then acknowledge webhook to avoid losing tasks on restart.
@@ -1959,6 +2000,8 @@ async def webhook(request: Request, background_tasks: BackgroundTasks) -> dict[s
     if event_ids:
         background_tasks.add_task(schedule_event_processing_by_ids, event_ids)
 
+    logger.info("WEBHOOK POST queued stored=%s", len(event_ids))
+
     return {"status": "ok", "queued": len(events), "stored": len(event_ids)}
 
 
@@ -1968,7 +2011,7 @@ async def test_endpoint(body: TestRequest) -> dict[str, str]:
     reply, _ = await process_message(
         body.user_id,
         body.message,
-        source="unknown",
+        source=body.source,
         attachments_count=body.attachments_count,
         attachment_types=body.attachment_types,
         attachment_urls=body.attachment_urls,
@@ -1996,3 +2039,10 @@ async def admin_reload_products(request: Request) -> dict[str, Any]:
 @app.get("/")
 def health() -> dict[str, str]:
     return {"status": "running"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)

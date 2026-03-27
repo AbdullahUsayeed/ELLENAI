@@ -71,15 +71,17 @@ WEBHOOK_RATE_LIMIT_COUNT=60
 
 ### Start Bot
 ```powershell
-cd e:\Startupt\EllenAI
+Set-Location e:\Startupt\EllenAI
 .\.venv\Scripts\Activate.ps1
-python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+python main.py
 ```
 
 ### Run Test Suite
 ```powershell
 python test_webhook.py
 ```
+
+Note: `test_webhook.py` is for local `/test` simulation. Real Meta webhook delivery should be verified from Railway logs after deployment.
 
 ### Reload Products (No Restart)
 ```bash
