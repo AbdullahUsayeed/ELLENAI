@@ -1411,7 +1411,7 @@ async def process_message(
     async with user_lock:
         allowed = await _consume_rate_limit(user_id)
         if not allowed:
-            return "Apu ektu slow korun please, onek fast message ashtese. 10-20 sec por abar try korun.", False
+            return "Apu ektu slow korun please, onek fast message ashtese. 10-20 sec por abar try korun.", True
 
         session = await ensure_user_session(user_id)
         previous_state = int(session["state"])
@@ -1422,12 +1422,12 @@ async def process_message(
         if clean_message and session.get("state") in {0, 1} and _is_catalog_query(clean_message):
             matches = _search_catalog_products(clean_message, source=source, limit=5)
             if matches:
-                return _format_catalog_matches_reply(clean_message, source, matches), False
+                return _format_catalog_matches_reply(clean_message, source, matches), True
             await send_owner_alert(
                 source,
                 f"CUSTOMER QUERY (no match)\nSource: {source}\nUser: {user_id}\nText: {clean_message}",
             )
-            return "Apu eta check kore owner ke janacchi, little wait koren please.", False
+            return "Apu eta check kore owner ke janacchi, little wait koren please.", True
 
         pending_options = session.get("pending_product_options")
         if isinstance(pending_options, list) and pending_options:
@@ -1436,7 +1436,7 @@ async def process_message(
                 session["pending_product_options"] = []
                 selected_product = chosen
             else:
-                return _format_product_options_message(pending_options), False
+                return _format_product_options_message(pending_options), True
 
         if selected_product is None and attachment_urls:
             product_candidates = _resolve_product_candidates_from_attachments(attachment_urls)
@@ -1444,7 +1444,7 @@ async def process_message(
                 selected_product = product_candidates[0]
             elif len(product_candidates) > 1:
                 session["pending_product_options"] = product_candidates
-                return _format_product_options_message(product_candidates), False
+                return _format_product_options_message(product_candidates), True
 
         if inferred_attachments_count > 0 and selected_product is None and previous_state != 3:
             # If the user sent a plain image (not a product-post URL), try vision product inquiry
@@ -1470,7 +1470,7 @@ async def process_message(
                             else:
                                 lines.append(f"- {name}: {_canonical_full_link(key)}")
                         lines.append("Interested hole bolen, ami order confirm korte help kori.")
-                        return "\n".join(lines), False
+                        return "\n".join(lines), True
                     else:
                         await send_owner_alert(
                             source,
@@ -1480,9 +1480,9 @@ async def process_message(
                             f"Sorry apu, ekhon amader kache {product_type} nai 😢 "
                             "Notun product asle janabo! Onno kono product dekhte chai?"
                         )
-                        return reply, False
+                        return reply, True
 
-            return "This item is not available right now apu 😢", False
+            return "This item is not available right now apu 😢", True
 
         intent_data = await detect_intent(message)
 
@@ -1543,7 +1543,7 @@ async def process_message(
             saved = await asyncio.to_thread(db_save_session, user_id, session)
             if not saved:
                 logger.warning("Session version conflict while saving bargain flow user=%s", user_id)
-            return final_price_reply, False
+            return final_price_reply, True
 
         reply, allow_upsell = handle_message(
             user_id,
