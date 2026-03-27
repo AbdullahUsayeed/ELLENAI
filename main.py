@@ -402,6 +402,9 @@ def _normalize_catalog_query(text: str) -> str:
         "nose pin": "nose ring",
         "lip piercing": "lip ring",
         "lip-piercing": "lip ring",
+        "ear ring": "earring",
+        "ear rings": "earrings",
+        "non piercing earring": "without piercing earrings",
         "collection gulo": "collection",
     }
     for old, new in replacements.items():
@@ -458,6 +461,10 @@ def _is_catalog_query(text: str) -> bool:
         "price",
         "dam",
         "koto",
+        "earring",
+        "earrings",
+        "without piercing earrings",
+        "non piercing earrings",
         "nose ring",
         "lip ring",
     ]
