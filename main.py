@@ -1717,7 +1717,7 @@ async def process_message(
                 f"CUSTOMER QUESTION\nSource: {source}\nUser: {user_id}\nText: {clean_message}",
             )
             final_question_reply = await rewrite_reply("I'll confirm and let you know shortly", allow_upsell=False)
-            return final_question_reply, False
+            return final_question_reply, True
 
         if price_argument:
             bargaining_capped = _register_bargain_and_is_capped(session)
