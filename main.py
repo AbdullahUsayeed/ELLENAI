@@ -2,15 +2,11 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-import hashlib
-import hmac
 import json
 import logging
 import os
 import re
-import sqlite3
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +16,10 @@ from fastapi.responses import PlainTextResponse
 from openai import APIError, OpenAI
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
+from ellenai.settings import load_settings
+from ellenai.state_store import StateStore
+from ellenai.task_supervisor import TaskSupervisor
+from ellenai.webhook_events import extract_webhook_events, verify_meta_signature
 from product_store import load_products, normalize_product_url
 
 
@@ -31,37 +31,39 @@ logger = logging.getLogger("ellenai")
 
 load_dotenv()
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN", "")
-PAGE_ID = os.getenv("PAGE_ID", "")
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "ANY_STRING")
-APP_SECRET = os.getenv("APP_SECRET", "")
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+settings = load_settings()
 
-STATE_DB_PATH = Path(os.getenv("STATE_DB_PATH", "ellenai_state.db"))
-MESSAGE_SEND_DELAY_SECONDS = float(os.getenv("MESSAGE_SEND_DELAY_SECONDS", "5"))
-ENABLE_REPLY_REWRITE = os.getenv("ENABLE_REPLY_REWRITE", "1") == "1"
-REWRITE_CACHE_TTL_SECONDS = int(os.getenv("REWRITE_CACHE_TTL_SECONDS", "900"))
-INTENT_CACHE_TTL_SECONDS = int(os.getenv("INTENT_CACHE_TTL_SECONDS", "300"))
-INTENT_CACHE_MAX_SIZE = int(os.getenv("INTENT_CACHE_MAX_SIZE", "10000"))
-REWRITE_CACHE_MAX_SIZE = int(os.getenv("REWRITE_CACHE_MAX_SIZE", "10000"))
-SESSION_CACHE_MAX_SIZE = int(os.getenv("SESSION_CACHE_MAX_SIZE", "5000"))
+OPENAI_API_KEY = settings.openai_api_key
+PAGE_ACCESS_TOKEN = settings.page_access_token
+PAGE_ID = settings.page_id
+VERIFY_TOKEN = settings.verify_token
+APP_SECRET = settings.app_secret
+ADMIN_TOKEN = settings.admin_token
 
-OPENAI_RETRY_ATTEMPTS = int(os.getenv("OPENAI_RETRY_ATTEMPTS", "3"))
-OPENAI_RETRY_MIN_SECONDS = float(os.getenv("OPENAI_RETRY_MIN_SECONDS", "1"))
-OPENAI_RETRY_MAX_SECONDS = float(os.getenv("OPENAI_RETRY_MAX_SECONDS", "8"))
+STATE_DB_PATH = settings.state_db_path
+MESSAGE_SEND_DELAY_SECONDS = settings.message_send_delay_seconds
+ENABLE_REPLY_REWRITE = settings.enable_reply_rewrite
+REWRITE_CACHE_TTL_SECONDS = settings.rewrite_cache_ttl_seconds
+INTENT_CACHE_TTL_SECONDS = settings.intent_cache_ttl_seconds
+INTENT_CACHE_MAX_SIZE = settings.intent_cache_max_size
+REWRITE_CACHE_MAX_SIZE = settings.rewrite_cache_max_size
+SESSION_CACHE_MAX_SIZE = settings.session_cache_max_size
 
-USER_RATE_LIMIT_COUNT = int(os.getenv("USER_RATE_LIMIT_COUNT", "8"))
-USER_RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("USER_RATE_LIMIT_WINDOW_SECONDS", "20"))
-WEBHOOK_RATE_LIMIT_COUNT = int(os.getenv("WEBHOOK_RATE_LIMIT_COUNT", "60"))
-WEBHOOK_RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("WEBHOOK_RATE_LIMIT_WINDOW_SECONDS", "10"))
-PRODUCTS_FILE_PATH = Path(os.getenv("PRODUCTS_FILE_PATH", "products.json"))
-BKASH_NUMBER = os.getenv("BKASH_NUMBER", "01942776220")
-ADVANCE_PERCENT = float(os.getenv("ADVANCE_PERCENT", "0.60"))
-MIN_ORDER_TOTAL = int(os.getenv("MIN_ORDER_TOTAL", "600"))
-OWNER_DM_ID = os.getenv("OWNER_DM_ID", "")
-OWNER_DM_MESSENGER_ID = os.getenv("OWNER_DM_MESSENGER_ID", "")
-OWNER_DM_INSTAGRAM_ID = os.getenv("OWNER_DM_INSTAGRAM_ID", "")
+OPENAI_RETRY_ATTEMPTS = settings.openai_retry_attempts
+OPENAI_RETRY_MIN_SECONDS = settings.openai_retry_min_seconds
+OPENAI_RETRY_MAX_SECONDS = settings.openai_retry_max_seconds
+
+USER_RATE_LIMIT_COUNT = settings.user_rate_limit_count
+USER_RATE_LIMIT_WINDOW_SECONDS = settings.user_rate_limit_window_seconds
+WEBHOOK_RATE_LIMIT_COUNT = settings.webhook_rate_limit_count
+WEBHOOK_RATE_LIMIT_WINDOW_SECONDS = settings.webhook_rate_limit_window_seconds
+PRODUCTS_FILE_PATH = settings.products_file_path
+BKASH_NUMBER = settings.bkash_number
+ADVANCE_PERCENT = settings.advance_percent
+MIN_ORDER_TOTAL = settings.min_order_total
+OWNER_DM_ID = settings.owner_dm_id
+OWNER_DM_MESSENGER_ID = settings.owner_dm_messenger_id
+OWNER_DM_INSTAGRAM_ID = settings.owner_dm_instagram_id
 
 PRODUCT = {
     "name": "Oversized Hoodie",
@@ -168,69 +170,13 @@ def log_startup_configuration() -> None:
         PRODUCTS_FILE_PATH,
     )
 
-
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 def init_db() -> None:
-    STATE_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(STATE_DB_PATH) as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS sessions (
-                user_id TEXT PRIMARY KEY,
-                session_json TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                version INTEGER NOT NULL DEFAULT 0
-            )
-            """
-        )
-        session_cols = {row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
-        if "version" not in session_cols:
-            conn.execute("ALTER TABLE sessions ADD COLUMN version INTEGER NOT NULL DEFAULT 0")
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS message_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT NOT NULL,
-                text TEXT NOT NULL,
-                attachments_count INTEGER NOT NULL,
-                attachment_types_json TEXT NOT NULL,
-                attachment_urls_json TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_history_user ON message_history(user_id)")
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS incoming_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                status TEXT NOT NULL,
-                attempts INTEGER NOT NULL DEFAULT 0,
-                last_error TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_incoming_events_status ON incoming_events(status)")
+    state_store.init_db()
     logger.info("State DB initialized at %s", STATE_DB_PATH)
 
 
-# Track background processing tasks so shutdown can wait for them.
-_active_tasks: set[asyncio.Task] = set()
-
-
-def _spawn_task(coro) -> asyncio.Task:
-    """Create a tracked asyncio task that removes itself on completion."""
-    task = asyncio.create_task(coro)
-    _active_tasks.add(task)
-    task.add_done_callback(_active_tasks.discard)
-    return task
+task_supervisor = TaskSupervisor()
+state_store = StateStore(STATE_DB_PATH)
 
 
 @app.on_event("startup")
@@ -238,15 +184,15 @@ async def startup_event() -> None:
     log_startup_configuration()
     await asyncio.to_thread(init_db)
     await asyncio.to_thread(load_post_product_map)
-    _spawn_task(recover_pending_events())
+    task_supervisor.spawn(recover_pending_events())
 
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
-    if _active_tasks:
-        logger.info("Shutdown: waiting for %s active task(s) to complete", len(_active_tasks))
-        await asyncio.gather(*_active_tasks, return_exceptions=True)
-        logger.info("Shutdown: all tasks finished")
+    if task_supervisor.active_count:
+        logger.info("Shutdown: waiting for %s active task(s) to complete", task_supervisor.active_count)
+        finished = await task_supervisor.shutdown_wait()
+        logger.info("Shutdown: all tasks finished count=%s", finished)
 
 
 def _new_session() -> dict[str, Any]:
@@ -1054,125 +1000,35 @@ def _super_confused_reply() -> str:
 
 
 def db_save_session(user_id: str, session: dict[str, Any]) -> bool:
-    session_payload = {k: v for k, v in session.items() if k != "_version"}
-    payload = json.dumps(session_payload, ensure_ascii=True)
-    expected_version = int(session.get("_version", 0) or 0)
-    with sqlite3.connect(STATE_DB_PATH) as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        cursor = conn.execute(
-            """
-            UPDATE sessions
-            SET session_json = ?, updated_at = ?, version = version + 1
-            WHERE user_id = ? AND version = ?
-            """,
-            (payload, _utc_now_iso(), user_id, expected_version),
-        )
-        if cursor.rowcount == 1:
-            session["_version"] = expected_version + 1
-            return True
-
-        existing = conn.execute("SELECT version FROM sessions WHERE user_id = ?", (user_id,)).fetchone()
-        if existing is None:
-            conn.execute(
-                """
-                INSERT INTO sessions(user_id, session_json, updated_at, version)
-                VALUES (?, ?, ?, 0)
-                """,
-                (user_id, payload, _utc_now_iso()),
-            )
-            session["_version"] = 0
-            return True
-
-    return False
+    return state_store.save_session(user_id, session)
 
 
 def db_get_session(user_id: str) -> dict[str, Any] | None:
-    with sqlite3.connect(STATE_DB_PATH) as conn:
-        row = conn.execute("SELECT session_json, version FROM sessions WHERE user_id = ?", (user_id,)).fetchone()
-    if row is None:
-        return None
     try:
-        parsed = json.loads(str(row[0]))
-        if isinstance(parsed, dict):
-            parsed["_version"] = int(row[1] or 0)
-            return parsed
-        return None
-    except json.JSONDecodeError:
+        return state_store.get_session(user_id)
+    except (json.JSONDecodeError, ValueError, TypeError):
         logger.exception("Corrupt session for user %s", user_id)
         return None
 
 
 def db_insert_incoming_event(event: dict[str, Any]) -> int:
-    user_id = str(event.get("user_id", "")).strip()
-    payload = json.dumps(event, ensure_ascii=True)
-    now_iso = _utc_now_iso()
-    with sqlite3.connect(STATE_DB_PATH) as conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO incoming_events(user_id, payload_json, status, attempts, last_error, created_at, updated_at)
-            VALUES (?, ?, 'pending', 0, NULL, ?, ?)
-            """,
-            (user_id, payload, now_iso, now_iso),
-        )
-        return int(cursor.lastrowid)
+    return state_store.insert_incoming_event(event)
 
 
 def db_get_incoming_event(event_id: int) -> dict[str, Any] | None:
-    with sqlite3.connect(STATE_DB_PATH) as conn:
-        row = conn.execute(
-            "SELECT payload_json, status, attempts FROM incoming_events WHERE id = ?",
-            (event_id,),
-        ).fetchone()
-    if row is None:
-        return None
     try:
-        payload = json.loads(str(row[0]))
-        if not isinstance(payload, dict):
-            return None
-        payload["_db_status"] = str(row[1])
-        payload["_db_attempts"] = int(row[2] or 0)
-        return payload
-    except json.JSONDecodeError:
+        return state_store.get_incoming_event(event_id)
+    except (json.JSONDecodeError, ValueError, TypeError):
         logger.exception("Corrupt incoming event payload id=%s", event_id)
         return None
 
 
 def db_mark_incoming_event(event_id: int, status: str, error: str | None = None, increment_attempt: bool = False) -> None:
-    safe_error = (error or "")[:2000] if error else None
-    with sqlite3.connect(STATE_DB_PATH) as conn:
-        if increment_attempt:
-            conn.execute(
-                """
-                UPDATE incoming_events
-                SET status = ?, attempts = attempts + 1, last_error = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (status, safe_error, _utc_now_iso(), event_id),
-            )
-        else:
-            conn.execute(
-                """
-                UPDATE incoming_events
-                SET status = ?, last_error = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (status, safe_error, _utc_now_iso(), event_id),
-            )
+    state_store.mark_incoming_event(event_id, status, error=error, increment_attempt=increment_attempt)
 
 
 def db_fetch_pending_event_ids(limit: int = 200) -> list[int]:
-    with sqlite3.connect(STATE_DB_PATH) as conn:
-        rows = conn.execute(
-            """
-            SELECT id
-            FROM incoming_events
-            WHERE status IN ('pending', 'retry')
-            ORDER BY id ASC
-            LIMIT ?
-            """,
-            (max(1, limit),),
-        ).fetchall()
-    return [int(r[0]) for r in rows]
+    return state_store.fetch_pending_event_ids(limit)
 
 
 def db_append_history(
@@ -1182,56 +1038,11 @@ def db_append_history(
     attachment_types: list[str],
     attachment_urls: list[str],
 ) -> None:
-    with sqlite3.connect(STATE_DB_PATH) as conn:
-        conn.execute(
-            """
-            INSERT INTO message_history(
-                user_id, text, attachments_count, attachment_types_json, attachment_urls_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                user_id,
-                message,
-                max(0, attachments_count),
-                json.dumps(attachment_types, ensure_ascii=True),
-                json.dumps(attachment_urls, ensure_ascii=True),
-                _utc_now_iso(),
-            ),
-        )
+    state_store.append_history(user_id, message, attachments_count, attachment_types, attachment_urls)
 
 
 def db_recent_history(user_id: str, limit: int = 20) -> list[dict[str, Any]]:
-    with sqlite3.connect(STATE_DB_PATH) as conn:
-        rows = conn.execute(
-            """
-            SELECT text, attachments_count, attachment_types_json, attachment_urls_json, created_at
-            FROM message_history
-            WHERE user_id = ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (user_id, max(1, limit)),
-        ).fetchall()
-    result: list[dict[str, Any]] = []
-    for text, cnt, types_json, urls_json, created_at in reversed(rows):
-        try:
-            types = json.loads(str(types_json))
-        except json.JSONDecodeError:
-            types = []
-        try:
-            urls = json.loads(str(urls_json))
-        except json.JSONDecodeError:
-            urls = []
-        result.append(
-            {
-                "text": str(text),
-                "attachments_count": int(cnt),
-                "attachment_types": [str(t).lower() for t in (types or [])],
-                "attachment_urls": [str(u) for u in (urls or [])],
-                "created_time": str(created_at),
-            }
-        )
-    return result
+    return state_store.recent_history(user_id, limit)
 
 
 async def append_history(
@@ -1840,105 +1651,6 @@ async def send_owner_alert(source: str, text: str) -> None:
             logger.warning("Owner alert send failed source=%s owner=%s result=%s", source, owner_id, result)
 
 
-def verify_meta_signature(raw_body: bytes, signature_header: str | None) -> bool:
-    if not APP_SECRET:
-        # Allow local development when secret is not configured.
-        return True
-
-    if not signature_header or not signature_header.startswith("sha256="):
-        return False
-
-    expected = "sha256=" + hmac.new(APP_SECRET.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, signature_header)
-
-
-def _count_supported_attachments(attachments: list[dict[str, Any]]) -> int:
-    supported = {"image", "video", "share"}
-    return sum(1 for att in attachments if str(att.get("type", "")).lower() in supported)
-
-
-def _extract_attachment_types(attachments: list[dict[str, Any]]) -> list[str]:
-    return [str(att.get("type", "")).lower() for att in attachments if str(att.get("type", "")).strip()]
-
-
-def _extract_attachment_urls(attachments: list[dict[str, Any]]) -> list[str]:
-    urls: list[str] = []
-    for att in attachments:
-        payload = att.get("payload", {}) if isinstance(att, dict) else {}
-        image_obj = payload.get("image", {}) if isinstance(payload.get("image"), dict) else {}
-        candidates = [
-            payload.get("url"),
-            payload.get("src"),
-            image_obj.get("url"),
-            image_obj.get("link"),
-        ]
-        for c in candidates:
-            value = str(c).strip() if c else ""
-            if value and value.startswith("http"):
-                urls.append(value)
-    return urls
-
-
-def _extract_webhook_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    events: list[dict[str, Any]] = []
-
-    for entry in payload.get("entry", []):
-        for msg_event in entry.get("messaging", []):
-            sender = msg_event.get("sender", {})
-            message_obj = msg_event.get("message", {})
-
-            # Skip echo events (the page's own sent messages echoed back by Meta).
-            if message_obj.get("is_echo"):
-                continue
-
-            user_id = str(sender.get("id", "")).strip()
-            text = str(message_obj.get("text", "")).strip()
-            attachments = message_obj.get("attachments", []) or []
-            attachments_count = _count_supported_attachments(attachments)
-            attachment_types = _extract_attachment_types(attachments)
-            attachment_urls = _extract_attachment_urls(attachments)
-
-            if not user_id:
-                continue
-
-            if text or attachments_count > 0:
-                events.append(
-                    {
-                        "user_id": user_id,
-                        "source": "messenger",
-                        "message": text,
-                        "attachments_count": attachments_count,
-                        "attachment_types": attachment_types,
-                        "attachment_urls": attachment_urls,
-                    }
-                )
-
-        for change in entry.get("changes", []):
-            value = change.get("value", {})
-            source = str(value.get("messaging_product") or "instagram").strip().lower()
-            messages = value.get("messages", [])
-            for msg in messages:
-                user_id = str(msg.get("from", "")).strip()
-                text = str(msg.get("text", {}).get("body", "")).strip()
-                attachments = msg.get("attachments", []) or []
-                attachments_count = _count_supported_attachments(attachments)
-                attachment_types = _extract_attachment_types(attachments)
-                attachment_urls = _extract_attachment_urls(attachments)
-                if user_id and (text or attachments_count > 0):
-                    events.append(
-                        {
-                            "user_id": user_id,
-                            "source": source,
-                            "message": text,
-                            "attachments_count": attachments_count,
-                            "attachment_types": attachment_types,
-                            "attachment_urls": attachment_urls,
-                        }
-                    )
-
-    return events
-
-
 async def process_event(event: dict[str, Any]) -> None:
     user_id = event["user_id"]
     source = str(event.get("source") or "unknown")
@@ -2016,7 +1728,7 @@ async def webhook(request: Request) -> dict[str, Any]:
         len(raw_body),
         bool(signature),
     )
-    if not verify_meta_signature(raw_body, signature):
+    if not verify_meta_signature(raw_body, signature, APP_SECRET):
         logger.warning("WEBHOOK POST rejected invalid signature")
         raise HTTPException(status_code=403, detail="Invalid signature")
 
@@ -2025,7 +1737,7 @@ async def webhook(request: Request) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=400, detail=f"Invalid JSON payload: {exc}") from exc
 
-    events = _extract_webhook_events(payload)
+    events = extract_webhook_events(payload)
     logger.info("WEBHOOK POST parsed events=%s object=%s", len(events), payload.get("object"))
 
     if not await _allow_webhook_batch(len(events)):
@@ -2039,7 +1751,7 @@ async def webhook(request: Request) -> dict[str, Any]:
         event_ids.append(event_id)
 
     if event_ids:
-        _spawn_task(schedule_event_processing_by_ids(event_ids))
+        task_supervisor.spawn(schedule_event_processing_by_ids(event_ids))
 
     logger.info("WEBHOOK POST queued stored=%s", len(event_ids))
 
