@@ -1850,6 +1850,11 @@ def _extract_webhook_events(payload: dict[str, Any]) -> list[dict[str, Any]]:
         for msg_event in entry.get("messaging", []):
             sender = msg_event.get("sender", {})
             message_obj = msg_event.get("message", {})
+
+            # Skip echo events (the page's own sent messages echoed back by Meta).
+            if message_obj.get("is_echo"):
+                continue
+
             user_id = str(sender.get("id", "")).strip()
             text = str(message_obj.get("text", "")).strip()
             attachments = message_obj.get("attachments", []) or []
