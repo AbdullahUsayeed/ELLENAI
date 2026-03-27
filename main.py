@@ -268,7 +268,14 @@ def _resolve_product_candidates_from_attachments(attachment_urls: list[str]) -> 
 
 
 def _format_product_options_message(options: list[dict[str, Any]]) -> str:
-    lines = ["🛍️ This post has multiple options - pick one apu!\nReply with the number:"]
+    lines = [
+        "🛍️ This post has multiple options - which one do you want?\n"
+        "You can:",
+        "  📌 Reply with the number (1, 2, 3, etc.)",
+        "  🔍 Tell me which slide (slide 1, slide 2...)",
+        "  ⭕ Circle/highlight the product & send a screenshot",
+        "\nHere's what we have:"
+    ]
     for idx, option in enumerate(options, start=1):
         name = str(option.get("name") or "Item")
         price = int(option.get("price") or 0)
@@ -817,14 +824,18 @@ async def rewrite_reply(text: str, allow_upsell: bool = False, tone: str = "defa
 
 
 def _analyze_payment_image_sync(image_url: str, message: str) -> bool:
+    """Analyze if image is a valid bKash/payment screenshot.
+    Must show transaction ID, amount, reference number, or similar payment indicators."""
     if client is None or not image_url:
         return False
 
     prompt = (
-        "You are checking whether an image is a payment proof screenshot for ecommerce. "
-        "Respond only JSON: {\"is_payment_proof\": true|false, \"reason\": \"short text\"}. "
-        "Mark false for random photos, memes, product shots, or social posts. "
-        f"User text context: {message}"
+        "You are verifying whether an image is a valid bKash/Nagad/Rocket payment screenshot. "
+        "Look for indicators like: transaction ID (TRX ID), reference number, amount sent, merchant name, timestamp, confirmation message. "
+        "Respond only JSON: {\"is_payment_proof\": true|false, \"reason\": \"short explanation\"}. "
+        "Mark false for: screenshots without transaction details, random phone screens, product photos, or unclear payments. "
+        "Mark true only if it clearly shows a completed payment transaction. "
+        f"User context: {message}"
     )
 
     try:
@@ -846,7 +857,9 @@ def _analyze_payment_image_sync(image_url: str, message: str) -> bool:
             "analyze_payment_image",
         )
         parsed = json.loads(response.choices[0].message.content or "{}")
-        return bool(parsed.get("is_payment_proof", False))
+        is_valid = bool(parsed.get("is_payment_proof", False))
+        logger.info("Payment proof analysis: is_valid=%s reason=%s", is_valid, parsed.get("reason", "N/A"))
+        return is_valid
     except (APIError, json.JSONDecodeError, ValueError) as exc:
         logger.exception("Payment image analysis failed: %s", exc)
         return False
@@ -1157,6 +1170,8 @@ async def append_history(
 
 
 def _detect_payment_proof_keyword(message: str, attachment_types: list[str], state: int) -> bool:
+    """Detect if message contains payment keywords AND has image attachment.
+    Only valid if we're in payment state (state 3) and image contains payment proof indicators."""
     if state != 3:
         return False
     normalized_types = {str(t).lower().strip() for t in attachment_types if str(t).strip()}
@@ -1164,8 +1179,11 @@ def _detect_payment_proof_keyword(message: str, attachment_types: list[str], sta
     if not has_image:
         return False
     text = message.lower().strip()
-    proof_words = ["paid", "payment", "trx", "bkash", "nagad", "rocket", "screenshot", "ss", "proof"]
+    # Must mention payment-related keywords when sending screenshot
+    proof_words = ["paid", "payment", "sent", "trx", "bkash", "nagad", "rocket", "screenshot", "ss", "proof", "advance", "transferred"]
     mentions_payment = any(w in text for w in proof_words)
+    # If no text but has image, could still be valid (checking if image is payment proof)
+    # If text exists, it MUST mention payment
     return has_image and ((not text) or mentions_payment)
 
 
@@ -1291,7 +1309,10 @@ def handle_message(
         if not session["cart"]["items"]:
             _add_or_update_item(session, quantity, color, product=selected_product)
 
-        if int(session["cart"].get("total_price", 0) or 0) <= MIN_ORDER_TOTAL:
+        cart_total = int(session["cart"].get("total_price", 0) or 0)
+        if cart_total <= MIN_ORDER_TOTAL:
+            need_more = max(MIN_ORDER_TOTAL - cart_total, 1)
+            logger.info("ORDER BLOCKED - Below minimum. user total=%s minimum=%s need=%s", cart_total, MIN_ORDER_TOTAL, need_more)
             return _min_order_message(session, source), False
 
         if color and session["cart"]["items"]:
@@ -1306,12 +1327,21 @@ def handle_message(
         if not session["location"]:
             return "We need your full address apu - building, street, area, everything! 📍", False
 
-        if int(session["cart"].get("total_price", 0) or 0) <= MIN_ORDER_TOTAL:
+        cart_total = int(session["cart"].get("total_price", 0) or 0)
+        if cart_total <= MIN_ORDER_TOTAL:
             return _min_order_message(session, source), False
 
         session["state"] = 3
         summary = _build_order_summary(session)
-        reply = summary + f"\n{_create_closing_cta(3)}\nSend your bKash screenshot now - that's it! 💳"
+        reply = (
+            summary + 
+            f"\n✅ ORDER TOTAL: {cart_total} {_session_currency(session)}\n"
+            f"(Minimum order: {MIN_ORDER_TOTAL} {_session_currency(session)} - Your order qualifies ✓)\n\n"
+            f"💳 PAYMENT REQUIRED:\n"
+            f"Send to: bKash {BKASH_NUMBER}\n"
+            f"{_create_closing_cta(3)}\n"
+            f"📸 IMPORTANT: After sending, MUST reply with screenshot to confirm!"
+        )
         return reply, False
 
     if intent == "payment" or (session["state"] == 3 and payment_detected):
@@ -1321,19 +1351,32 @@ def handle_message(
         currency = _session_currency(session)
         if not payment_proof_detected:
             return (
-                f"💳 Payment: Send {breakdown['advance']} {currency} on bKash to {BKASH_NUMBER}\n"
-                f"Total: {breakdown['grand_total']} {currency} | Advance: {breakdown['advance']} | COD: {breakdown['remaining']} {currency}\n"
-                f"After you send, reply with the screenshot - that confirms everything! 🎯"
+                f"💳 bKash PAYMENT REQUIRED:\n"
+                f"Send to: {BKASH_NUMBER}\n"
+                f"Amount: {breakdown['advance']} {currency} (advance/60%)\n\n"
+                f"💰 Order Breakdown:\n"
+                f"• Total: {breakdown['grand_total']} {currency}\n"
+                f"• Advance (60%): {breakdown['advance']} {currency} → Send now to bKash\n"
+                f"• Cash on delivery (40%): {breakdown['remaining']} {currency}\n\n"
+                f"📸 IMPORTANT:\n"
+                f"After sending the bKash payment, MUST send a screenshot of the transaction!\n"
+                f"Screenshot should show: Transaction ID, Amount, Status (Sent/Received)\n\n"
+                f"👉 Send screenshot now to confirm your order! 🎯"
             ), False
         session["payment_proof_received"] = True
         session["state"] = 4
+        logger.info("PAYMENT CONFIRMED user=%s amount=%s", session.get("user_id", "unknown"), breakdown['advance'])
         return (
             f"🎉 ORDER CONFIRMED! 🎉\n"
-            f"Total: {breakdown['grand_total']} {currency}\n"
-            f"Advance paid: {breakdown['advance']} {currency} ✓\n"
-            f"COD: {breakdown['remaining']} {currency}\n"
-            f"Delivery: {DELIVERY_TIME_TEXT}\n"
-            f"Our team will contact you with tracking info. Thank you apu! 🙏"
+            f"✅ Payment verified - bKash screenshot received!\n\n"
+            f"📦 Order Details:\n"
+            f"• Total: {breakdown['grand_total']} {currency}\n"
+            f"• Advance paid: {breakdown['advance']} {currency} ✓\n"
+            f"• COD on delivery: {breakdown['remaining']} {currency}\n"
+            f"• Delivery location: {session.get('location', 'N/A')}\n"
+            f"• Delivery time: {DELIVERY_TIME_TEXT}\n\n"
+            f"Our team will contact you within 1-2 hours with tracking details.\n"
+            f"Thank you for your order apu! 🙏"
         ), False
 
     if session["state"] == 4:
