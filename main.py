@@ -1000,12 +1000,55 @@ def _add_or_update_item(
     _recalc_total(session)
 
 
+def _get_available_product_types() -> list[str]:
+    """Extract unique product types/categories from catalog."""
+    product_types: set[str] = set()
+    for variants in PRODUCT_MAP.values():
+        for product in variants:
+            name = str(product.get("name", "")).lower()
+            # Extract main category keywords
+            keywords = {
+                "earring": "Earrings",
+                "ring": "Rings",
+                "glasses": "Glasses",
+                "lens": "Lenses",
+                "bag": "Bags",
+                "boot": "Boots",
+                "eyelash": "Eyelashes",
+                "lash": "Lashes",
+                "flower": "Flowers",
+                "jersey": "Jersey",
+            }
+            for keyword, display_name in keywords.items():
+                if keyword in name:
+                    product_types.add(display_name)
+    return sorted(product_types)
+
+
 def _safe_default_reply() -> str:
-    return "I didn't quite understand apu! What are you looking for? Price? Colors? Quantity? Tell me more 😊"
+    """Guide confused customer with multiple options to clarify intent."""
+    product_types = _get_available_product_types()
+    types_list = ", ".join(product_types[:5]) if product_types else "earrings, glasses, bags, etc"
+    
+    return (
+        f"Hmm, I'm not quite sure what you're looking for! 🤔\n\n"
+        f"Try one of these:\n"
+        f"📸 Share a picture of what you want → I'll find it!\n"
+        f"🔗 Share a link from our posts\n"
+        f"💬 Tell me what: {types_list}, and more!\n\n"
+        f"What works best apu? 😊"
+    )
 
 
 def _super_confused_reply() -> str:
-    return "Let me check with Ellen quickly and come back to you within the hour apu. Thanks for your patience!"
+    """After multiple confusions, offer direct human help."""
+    return (
+        "I'm having trouble understanding, apu 😅\n\n"
+        "💡 Best way to help you:\n"
+        "→ Share a picture of what you want OR\n"
+        "→ Ask for a specific product (earrings, bags, glasses, etc.)\n\n"
+        "Or I'll connect you with Ellen directly! Just say 'help' & we'll sort it out! 🙌"
+    )
 
 
 def _create_urgency_cta(product_name: str = None) -> str:
@@ -1547,14 +1590,27 @@ async def process_message(
                             source,
                             f"CUSTOMER IMAGE QUERY (no match)\\nSource: {source}\\nUser: {user_id}\\nText: {clean_message}\\nProduct type: {product_type}\\nStyle hints: {style_hints}",
                         )
+                        product_types = _get_available_product_types()
+                        types_list = ", ".join(product_types[:6]) if product_types else "earrings, glasses, bags"
                         reply = (
-                            f"Love this style! We don't have that exact {product_type} in stock right now 😢\n"
-                            f"But I've notified our team - we might get something similar soon!\n\n"
-                            f"Want to check out our other {product_type}s apu? I can show you some alternatives! 🛍️"
+                            f"Great photo! We don't have that exact {product_type} in stock now 😢\n"
+                            f"But we have: {types_list} & more!\n\n"
+                            f"Want to see what we have instead apu? Just say which one! 🛍️"
                         )
                         return reply, True
+                else:
+                    # Image sent but no clear product identified
+                    product_types = _get_available_product_types()
+                    types_list = ", ".join(product_types[:6]) if product_types else "earrings, glasses, bags"
+                    return (
+                        f"Nice pic! 📸 But I'm not sure what product you're showing apu.\n\n"
+                        f"Can you tell me what it is? We have:\n"
+                        f"👉 {types_list}\n"
+                        f"& more!\n\n"
+                        f"Or describe what you see & I'll search for it! 😊"
+                    ), True
 
-            return "Tell me what you're looking for apu! 😊 I can help better if you describe it or send a clearer image.", True
+            return "Tell me what you're looking for apu! 😊 I can help better if you describe it or send a picture.", True
 
         intent_data = await detect_intent(message)
 
