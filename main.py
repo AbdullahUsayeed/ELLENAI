@@ -72,36 +72,38 @@ PRODUCT = {
 }
 PRODUCT_MAP: dict[str, list[dict[str, Any]]] = {}
 
-PAYMENT_CONFIRMATION_TEXT = "To confirm your order, please send 60% in bKash. Remaining 40% cash on delivery."
-DELIVERY_CHARGE_TEXT = "Delivery charge: Inside Dhaka 85 tk, Outside Dhaka 150 tk."
-DELIVERY_TIME_TEXT = "20-25 days"
+PAYMENT_CONFIRMATION_TEXT = "To confirm: send 60% to bKash. Remaining 40% cash on delivery. Secure & fast! ✓"
+DELIVERY_CHARGE_TEXT = "Dhaka: 85 tk | Outside: 150 tk | Delivery: 20-25 days"
+DELIVERY_TIME_TEXT = "20-25 days (guaranteed)"
 
 BARGAIN_WINDOW_SECONDS = 120
 BARGAIN_CAP_AFTER_COUNT = 3
 
 STYLE_PROMPT = """
-You are a friendly Instagram shop girl.
+You are a professional, confident sales assistant.
 
 Tone:
 
-* Slightly girly
+* Direct and clear
 * Bangla + English mix (Banglish)
-* Casual, fun
+* Friendly but focused on closing sales
 
 Rules:
 
-* Short replies (1-2 lines)
-* Natural and human
-* Never change price or totals
-* Do not invent discounts
-* If user negotiates price, stay polite but firm
+* Short, punchy replies (1-2 lines max)
+* Use urgency tactfully (limited stock, popular items)
+* Always include clear next step/CTA
+* Never apologize for price - it's fair value
+* If price negotiation: acknowledge but stay firm
+* End with action-oriented language ("niben naki?", "confirm korbo?", "ready?")
 """
 
 STYLE_EXAMPLES = """
-apu eta onek cute, ami nijeyo use kortesi
-price 2500, quality onek bhalo trust me
-delivery 20-25 days lagbe apu
-niben naki? ami confirm kore rakhi?
+Yes! This is trending right now - 500 people bought last month. 2500 tk, grab it now apu!
+Size: M available. Niben naki? I'll process your order right away.
+Payment 60% bKash, 40% COD - totally secure. Ready to order?
+Stock limited apu - this model is almost soldout. Confirm now, I'll arrange delivery.
+It's premium quality, price is final. But I can add something cute to your order?
 """
 
 INTENTS = {"price", "order", "add_item", "deny", "location", "payment", "question", "other", "unknown"}
@@ -266,12 +268,12 @@ def _resolve_product_candidates_from_attachments(attachment_urls: list[str]) -> 
 
 
 def _format_product_options_message(options: list[dict[str, Any]]) -> str:
-    lines = ["Apu ei post e multiple options ache. Kon ta niben? Reply number diye den:"]
+    lines = ["🛍️ This post has multiple options - pick one apu!\nReply with the number:"]
     for idx, option in enumerate(options, start=1):
         name = str(option.get("name") or "Item")
         price = int(option.get("price") or 0)
         currency = str(option.get("currency") or "BDT")
-        lines.append(f"{idx}) {name} - {price} {currency}")
+        lines.append(f"  {idx}) {name} → {price} {currency}")
     return "\n".join(lines)
 
 
@@ -473,15 +475,16 @@ def _is_catalog_query(text: str) -> bool:
 
 def _format_catalog_matches_reply(query: str, source: str, matches: list[tuple[str, dict[str, Any]]]) -> str:
     if not matches:
-        return "Apu ei item ta ekhon stock e nai. Onno kono style dekhte chaile bolen, ami links dei."
+        return "That exact item isn't in stock right now apu 😢 But we have similar styles! What else can I show you?"
 
-    lines = ["Apu egula available ache, dekhun:"]
-    for key, variant in matches:
+    lines = ["✨ Great news! We have these available:"]
+    for idx, (key, variant) in enumerate(matches[:5], start=1):
         name = str(variant.get("name") or "Item")
         price = int(variant.get("price") or 0)
         currency = str(variant.get("currency") or "tk")
-        lines.append(f"- {name}: {price} {currency} | {_canonical_full_link(key)}")
-    lines.append("Kon ta niben bolen, ami order confirm korte help kori.")
+        lines.append(f"{idx}) {name}")
+        lines.append(f"   💰 {price} {currency} | Link: {_canonical_full_link(key)}")
+    lines.append("\n👉 Reply with the number or say 'add' to add to your order! Which one apu? 😊")
     return "\n".join(lines)
 
 
@@ -490,24 +493,24 @@ def _min_order_message(session: dict[str, Any], source: str) -> str:
     need_more = max(0, MIN_ORDER_TOTAL - subtotal)
     suggestions = _search_catalog_products("accessories budget", source, limit=3)
     lines = [
-        f"Apu minimum order {MIN_ORDER_TOTAL} tk. Ekhon cart {subtotal} tk.",
-        f"Order confirm korte aro {need_more} tk add korte hobe.",
+        f"📦 Minimum order: {MIN_ORDER_TOTAL} tk | Your current cart: {subtotal} tk",
+        f"You need just {need_more} tk more to place your order! 🎯",
+        "💡 Perfect add-ons:",
     ]
     if suggestions:
-        lines.append("Quick add-on ideas:")
-        for key, variant in suggestions:
+        for idx, (key, variant) in enumerate(suggestions[:3], start=1):
             lines.append(
-                f"- {variant.get('name', 'Item')} - {int(variant.get('price') or 0)} {variant.get('currency') or 'tk'} | {_canonical_full_link(key)}"
+                f"{idx}) {variant.get('name', 'Item')} → {int(variant.get('price') or 0)} {variant.get('currency') or 'tk'} | {_canonical_full_link(key)}"
             )
+        lines.append("\n👉 Add one & complete your order! Which one? 😊")
     return "\n".join(lines)
 
 
 def _payment_and_delivery_policy_lines() -> list[str]:
     return [
-        PAYMENT_CONFIRMATION_TEXT,
-        DELIVERY_CHARGE_TEXT,
-        f"bKash (send money): {BKASH_NUMBER}",
-        f"Delivery time: {DELIVERY_TIME_TEXT}",
+        "💳 " + PAYMENT_CONFIRMATION_TEXT,
+        "📦 " + DELIVERY_CHARGE_TEXT,
+        f"🏦 bKash: {BKASH_NUMBER}",
     ]
 
 
@@ -989,11 +992,36 @@ def _add_or_update_item(
 
 
 def _safe_default_reply() -> str:
-    return "Oops apu, ami buste parini, kindly bolben ki niben?"
+    return "I didn't quite understand apu! What are you looking for? Price? Colors? Quantity? Tell me more 😊"
 
 
 def _super_confused_reply() -> str:
-    return "Lemme confirm from Ellen and get back to you right away apu"
+    return "Let me check with Ellen quickly and come back to you within the hour apu. Thanks for your patience!"
+
+
+def _create_urgency_cta(product_name: str = None) -> str:
+    """Generate urgency-focused CTA for closing sales."""
+    messages = [
+        "This is selling fast apu - limited stock left!",
+        "Stock alert: Only a few pieces remaining!",
+        "This design just came in - grab it before it's gone!",
+    ]
+    return messages[len(product_name or "") % len(messages)] if product_name else messages[0]
+
+
+def _create_closing_cta(current_state: int, cart_total: int = 0) -> str:
+    """Generate closing-focused call-to-action based on conversation state."""
+    if current_state == 0:
+        return "Ready to order? Just tell me quantity & color! ✓"
+    elif current_state == 1:
+        return "Confirm this order now apu? Or add more items?"
+    elif current_state == 2:
+        return "Just need your address - then we finalize! ✓"
+    elif current_state == 3:
+        return "Payment screenshot will complete your order. Send now? 💳"
+    elif current_state == 4:
+        return "Your order is locked in! Tracking details coming soon. 📦"
+    return "What's next apu? I'm ready to help! 😊"
 
 
 def db_save_session(user_id: str, session: dict[str, Any]) -> bool:
@@ -1153,28 +1181,32 @@ def handle_message(
     if intent == "deny":
         session["cart"] = {"items": [], "total_price": 0}
         session["state"] = 0
-        return "Aight, cart cleared! Onno kisu nite chao?", False
+        return "No problem apu! Cart cleared. 🗑️ Anything else you'd like to explore? We have new arrivals!", False
 
     if intent == "price":
         product = selected_product or PRODUCT
         name = str(product.get("name") or PRODUCT["name"])
         price = int(product.get("price") or PRODUCT["price"])
         currency = str(product.get("currency") or PRODUCT["currency"])
-        return f"Apu, {name} er price {price} {currency}! Nite chaile bolen, order confirm kore dei. 😊", False
+        return f"✓ {name}: {price} {currency} - Premium quality, best price! Ready to add to your order? Just say yes! 😊", False
 
     if intent == "add_item":
         _add_or_update_item(session, quantity, color, product=selected_product)
         session["state"] = 1
 
         item_count = sum(item["quantity"] for item in session["cart"]["items"])
-        reply = (
-            f"Items in cart: {item_count}. "
-            f"Total: {session['cart']['total_price']} {_session_currency(session)}. "
-            + " ".join(_payment_and_delivery_policy_lines())
-        )
-
+        cart_total = session['cart']['total_price']
+        currency = _session_currency(session)
+        
+        # Build concise, action-focused reply
+        reply = f"✓ Added to cart! Total now: {cart_total} {currency}"
+        
         if color is None:
-            reply += " Which color do you want?"
+            reply += " | What color? (Black/White/etc)"
+        else:
+            reply += f" | {color.upper()} selected"
+        
+        reply += f" | {_create_closing_cta(1, cart_total)}"
 
         if not session["upsell_used"]:
             allow_upsell = True
@@ -1192,52 +1224,53 @@ def handle_message(
             session["cart"]["items"][-1]["color"] = color
 
         session["state"] = 2
-        return "Please share your delivery location.", False
+        return f"Perfect! 🎯 Just one more step - where should we deliver? Share your full address apu! {_create_closing_cta(2)}", False
 
     if intent == "location" or (session["state"] == 2 and location):
         if location:
             session["location"] = location
         if not session["location"]:
-            return "Please share your full delivery location.", False
+            return "We need your full address apu - building, street, area, everything! 📍", False
 
         if int(session["cart"].get("total_price", 0) or 0) <= MIN_ORDER_TOTAL:
             return _min_order_message(session, source), False
 
         session["state"] = 3
         summary = _build_order_summary(session)
-        reply = summary + "\nPlease send your bKash screenshot to confirm."
+        reply = summary + f"\n{_create_closing_cta(3)}\nSend your bKash screenshot now - that's it! 💳"
         return reply, False
 
     if intent == "payment" or (session["state"] == 3 and payment_detected):
         if session["state"] != 3:
-            return "Please share your location first so I can prepare your order summary.", False
+            return "I need your address first to finalize! Share it now? 📍", False
         breakdown = _payment_breakdown(session, session.get("location"))
         currency = _session_currency(session)
         if not payment_proof_detected:
             return (
-                f"Thanks apu. Please send {breakdown['advance']} {currency} on bKash ({BKASH_NUMBER}) with screenshot to confirm. "
-                f"Total with delivery {breakdown['grand_total']} {currency}; remaining {breakdown['remaining']} {currency} cash on delivery."
+                f"💳 Payment: Send {breakdown['advance']} {currency} on bKash to {BKASH_NUMBER}\n"
+                f"Total: {breakdown['grand_total']} {currency} | Advance: {breakdown['advance']} | COD: {breakdown['remaining']} {currency}\n"
+                f"After you send, reply with the screenshot - that confirms everything! 🎯"
             ), False
         session["payment_proof_received"] = True
         session["state"] = 4
         return (
-            "Payment noted. Your order is confirmed. "
-            f"Total {breakdown['grand_total']} {currency}. "
-            f"Advance paid {breakdown['advance']} {currency}. "
-            f"Remaining {breakdown['remaining']} {currency} cash on delivery. "
-            f"bKash number: {BKASH_NUMBER}. "
-            f"Delivery time: {DELIVERY_TIME_TEXT}."
+            f"🎉 ORDER CONFIRMED! 🎉\n"
+            f"Total: {breakdown['grand_total']} {currency}\n"
+            f"Advance paid: {breakdown['advance']} {currency} ✓\n"
+            f"COD: {breakdown['remaining']} {currency}\n"
+            f"Delivery: {DELIVERY_TIME_TEXT}\n"
+            f"Our team will contact you with tracking info. Thank you apu! 🙏"
         ), False
 
     if session["state"] == 4:
-        return "Your order is already confirmed. Thank you.", False
+        return f"✓ Your order is confirmed and being processed! You'll get tracking details soon. Thank you apu! 🙏 {_create_closing_cta(4)}", False
 
     if not session["cart"]["items"]:
-        return f"{PRODUCT['name']} price is {PRODUCT['price']} {_session_currency(session)}.", False
+        return f"Our bestseller: {PRODUCT['name']} - just {PRODUCT['price']} {_session_currency(session)}! Premium quality. Ready to order? 🛍️", False
 
     return (
-        f"Current total: {session['cart']['total_price']} {_session_currency(session)}. "
-        "Tell me quantity, color, or say confirm order."
+        f"📦 Cart: {session['cart']['total_price']} {_session_currency(session)} | "
+        f"{_create_closing_cta(1, session['cart']['total_price'])}"
     ), False
 
 
@@ -1411,7 +1444,7 @@ async def process_message(
     async with user_lock:
         allowed = await _consume_rate_limit(user_id)
         if not allowed:
-            return "Apu ektu slow korun please, onek fast message ashtese. 10-20 sec por abar try korun.", True
+            return "Slow down apu! 🚦 Too many messages too fast. Give me 10-20 seconds, then try again. Thanks!", True
 
         session = await ensure_user_session(user_id)
         previous_state = int(session["state"])
@@ -1427,7 +1460,7 @@ async def process_message(
                 source,
                 f"CUSTOMER QUERY (no match)\nSource: {source}\nUser: {user_id}\nText: {clean_message}",
             )
-            return "Apu eta check kore owner ke janacchi, little wait koren please.", True
+            return "Let me check with our boss & get back to you in 5 mins with what we have! ✓", True
 
         pending_options = session.get("pending_product_options")
         if isinstance(pending_options, list) and pending_options:
@@ -1459,17 +1492,17 @@ async def process_message(
                 if product_type and is_inquiry:
                     matches = _search_catalog_products(product_type, source=source, limit=5)
                     if matches:
-                        lines = [f"Haa apu, {product_type} related options ache! Ekhane dekhun:"]
+                        lines = [f"✨ Perfect! We have {product_type} options. Check these out:"]
                         ask_price = any(w in lower_message for w in ["price", "koto", "dam"])
-                        for key, prod in matches[:3]:
+                        for idx, (key, prod) in enumerate(matches[:3], start=1):
                             name = str(prod.get("name") or product_type)
                             price = int(prod.get("price") or 0)
                             currency = str(prod.get("currency") or "tk")
                             if ask_price:
-                                lines.append(f"- {name}: {price} {currency} | {_canonical_full_link(key)}")
+                                lines.append(f"{idx}) {name}: {price} {currency} | {_canonical_full_link(key)}")
                             else:
-                                lines.append(f"- {name}: {_canonical_full_link(key)}")
-                        lines.append("Interested hole bolen, ami order confirm korte help kori.")
+                                lines.append(f"{idx}) {name}: {_canonical_full_link(key)}")
+                        lines.append("\n👉 Pick one & I'll add it to your cart! Which one apu? 😊")
                         return "\n".join(lines), True
                     else:
                         await send_owner_alert(
@@ -1477,12 +1510,12 @@ async def process_message(
                             f"CUSTOMER IMAGE QUERY (no match)\nSource: {source}\nUser: {user_id}\nText: {clean_message}",
                         )
                         reply = (
-                            f"Sorry apu, ekhon amader kache {product_type} nai 😢 "
-                            "Notun product asle janabo! Onno kono product dekhte chai?"
+                            f"We don't have that {product_type} in stock right now 😢 But new arrivals coming soon! "
+                            "Want to check out other styles apu? 🛍️"
                         )
                         return reply, True
 
-            return "This item is not available right now apu 😢", True
+            return "That item isn't available right now apu! 😢 Want to see similar options? I've got great alternatives!", True
 
         intent_data = await detect_intent(message)
 
@@ -1531,13 +1564,13 @@ async def process_message(
             bargaining_capped = _register_bargain_and_is_capped(session)
             base_price = int(selected_product.get("price") or PRODUCT["price"]) if selected_product else int(PRODUCT["price"])
             fixed_price_reply = (
-                f"I totally understand apu but price fixed at {base_price} {_session_currency(session)}. "
-                "Ami best quality maintain kortesi, tai price change kora possible na."
+                f"I understand apu, but {base_price} {_session_currency(session)} is our best price - we maintain premium quality! "
+                "That's why customers keep coming back. Ready to order? 💯"
             )
             if bargaining_capped:
                 fixed_price_reply = (
-                    f"Apu bujhte parchi, price fixed {base_price} {_session_currency(session)} and eta ar change kora possible na. "
-                    "Chaile ami order ta confirm kore dei now."
+                    f"The price is fixed at {base_price} {_session_currency(session)} - that's final. But it's worth every taka! "
+                    "Shall I process your order now? Just send your address! 🎯"
                 )
             final_price_reply = await rewrite_reply(fixed_price_reply, allow_upsell=False)
             saved = await asyncio.to_thread(db_save_session, user_id, session)
