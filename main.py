@@ -866,9 +866,9 @@ async def analyze_payment_images(attachment_types: list[str], attachment_urls: l
 
 def _identify_product_in_image_sync(image_url: str, message: str) -> dict[str, Any]:
     """Use GPT-4o vision to identify what product type is shown in an image.
-    Returns {"product_type": str | None, "is_product_inquiry": bool}."""
+    Returns {"product_type": str | None, "is_product_inquiry": bool, "style_hints": list[str]}."""
     if client is None or not image_url:
-        return {"product_type": None, "is_product_inquiry": False}
+        return {"product_type": None, "is_product_inquiry": False, "style_hints": []}
 
     product_names: list[str] = []
     for variants in PRODUCT_MAP.values():
@@ -880,13 +880,19 @@ def _identify_product_in_image_sync(image_url: str, message: str) -> dict[str, A
 
     prompt = (
         "You are a product recognition assistant for an online fashion store. "
-        "Look at the image and identify what type of product is shown (e.g. 'glasses', 'earrings', 'hoodie', 'dress', 'bag', etc.). "
-        "Also decide if the user is asking about product availability. "
+        "Look at the image and identify:\n"
+        "1. What type of product is shown (e.g. 'earrings', 'glasses', 'hoodie', 'dress', 'bag', 'bracelet', etc.)\n"
+        "2. Style descriptors (e.g. 'vintage', 'minimalist', 'bohemian', 'formal', 'casual', 'colorful', 'monochrome')\n"
+        "3. Whether the user is asking if this product is available\n\n"
         f"Our store catalog includes: {catalog_hint}. "
         f"User text: {message or '(no text)'}. "
-        'Respond ONLY with JSON: {"product_type": "short product category in English", "is_product_inquiry": true|false}. '
+        'Respond ONLY with JSON:\n'
+        '{"product_type": "primary product category in English", '
+        '"style_hints": ["style1", "style2", ...], '
+        '"is_product_inquiry": true|false}\n'
         "Set is_product_inquiry to true if the user is asking whether this product is available. "
-        "Set product_type to null if you cannot identify a product."
+        "Set product_type to null if you cannot identify a product. "
+        "Include 2-3 style descriptors to help find similar items."
     )
 
     try:
@@ -908,13 +914,16 @@ def _identify_product_in_image_sync(image_url: str, message: str) -> dict[str, A
             "identify_product_image",
         )
         parsed = json.loads(response.choices[0].message.content or "{}")
+        product_type = str(parsed.get("product_type") or "").strip().lower() or None
+        style_hints = [str(s).strip().lower() for s in (parsed.get("style_hints") or []) if str(s).strip()]
         return {
-            "product_type": str(parsed.get("product_type") or "").strip().lower() or None,
+            "product_type": product_type,
             "is_product_inquiry": bool(parsed.get("is_product_inquiry", True)),
+            "style_hints": style_hints,
         }
     except (APIError, json.JSONDecodeError, ValueError) as exc:
         logger.exception("Product image identification failed: %s", exc)
-        return {"product_type": None, "is_product_inquiry": False}
+        return {"product_type": None, "is_product_inquiry": False, "style_hints": []}
 
 
 def _search_product_by_type(product_type: str) -> list[tuple[str, dict[str, Any]]]:
@@ -1039,33 +1048,6 @@ def _get_add_on_suggestion(current_total: int, target_min: int) -> str | None:
                     name = str(prod.get("name", "Item"))
                     return f"💡 Add '{name}' ({price} tk) & confirm? Perfect combo!"
     return None
-
-
-def _should_show_urgency_prompt(session: dict[str, Any]) -> bool:
-    """Determine if we should show urgency/scarcity messaging."""
-    # Show urgency if:
-    # - Customer has items in cart (considering buying)
-    # - We haven't already used urgency in this session
-    if not session.get("cart", {}).get("items"):
-        return False
-    return not session.get("_urgency_shown", False)
-
-
-def _mark_urgency_shown(session: dict[str, Any]) -> None:
-    """Mark that we've shown urgency messaging in this session."""
-    session["_urgency_shown"] = True
-
-
-def _get_urgency_message() -> str:
-    """Get a compelling urgency/scarcity message."""
-    messages = [
-        "📊 Most orders ship within 24 hours - order now!",
-        "🔥 Limited pieces remaining in this design!",
-        "⚡ Last chance to grab these bestsellers!",
-        "⏰ Stock moves fast - confirm now apu!",
-    ]
-    import random
-    return random.choice(messages)
 
 
 def db_save_session(user_id: str, session: dict[str, Any]) -> bool:
@@ -1250,12 +1232,7 @@ def handle_message(
         else:
             reply += f" | {color.upper()} selected"
         
-        # Add urgency messaging if appropriate
-        if _should_show_urgency_prompt(session):
-            reply += f" | {_get_urgency_message()}"
-            _mark_urgency_shown(session)
-        
-        # Add upsell suggestion if below minimum
+        # Add upsell suggestion if below minimum, otherwise standard CTA
         addon_suggestion = _get_add_on_suggestion(cart_total, MIN_ORDER_TOTAL)
         if addon_suggestion:
             reply += f" | {addon_suggestion}"
@@ -1544,32 +1521,40 @@ async def process_message(
                 is_inquiry = identification.get("is_product_inquiry", True)
 
                 if product_type and is_inquiry:
-                    matches = _search_catalog_products(product_type, source=source, limit=5)
+                    # Try to find matching products, combining product type and style hints
+                    search_query = product_type
+                    style_hints = identification.get("style_hints", [])
+                    if style_hints:
+                        search_query = f"{product_type} {' '.join(style_hints[:2])}"
+                    
+                    matches = _search_catalog_products(search_query, source=source, limit=5)
                     if matches:
-                        lines = [f"✨ Perfect! We have {product_type} options. Check these out:"]
+                        lines = [f"✨ Great eye! We have {product_type} that match what you showed:\n"]
                         ask_price = any(w in lower_message for w in ["price", "koto", "dam"])
-                        for idx, (key, prod) in enumerate(matches[:3], start=1):
+                        for idx, (key, prod) in enumerate(matches[:5], start=1):
                             name = str(prod.get("name") or product_type)
                             price = int(prod.get("price") or 0)
                             currency = str(prod.get("currency") or "tk")
+                            link = _canonical_full_link(key)
                             if ask_price:
-                                lines.append(f"{idx}) {name}: {price} {currency} | {_canonical_full_link(key)}")
+                                lines.append(f"{idx}) {name} - {price} {currency}\n   🔗 {link}")
                             else:
-                                lines.append(f"{idx}) {name}: {_canonical_full_link(key)}")
-                        lines.append("\n👉 Pick one & I'll add it to your cart! Which one apu? 😊")
+                                lines.append(f"{idx}) {name}\n   🔗 {link}")
+                        lines.append(f"\n👉 Reply with the number to add one to your cart, or visit the link directly! Any of these apu? 😊")
                         return "\n".join(lines), True
                     else:
                         await send_owner_alert(
                             source,
-                            f"CUSTOMER IMAGE QUERY (no match)\nSource: {source}\nUser: {user_id}\nText: {clean_message}",
+                            f"CUSTOMER IMAGE QUERY (no match)\\nSource: {source}\\nUser: {user_id}\\nText: {clean_message}\\nProduct type: {product_type}\\nStyle hints: {style_hints}",
                         )
                         reply = (
-                            f"We don't have that {product_type} in stock right now 😢 But new arrivals coming soon! "
-                            "Want to check out other styles apu? 🛍️"
+                            f"Love this style! We don't have that exact {product_type} in stock right now 😢\n"
+                            f"But I've notified our team - we might get something similar soon!\n\n"
+                            f"Want to check out our other {product_type}s apu? I can show you some alternatives! 🛍️"
                         )
                         return reply, True
 
-            return "That item isn't available right now apu! 😢 Want to see similar options? I've got great alternatives!", True
+            return "Tell me what you're looking for apu! 😊 I can help better if you describe it or send a clearer image.", True
 
         intent_data = await detect_intent(message)
 
