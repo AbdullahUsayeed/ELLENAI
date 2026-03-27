@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 from openai import APIError, OpenAI
 from pydantic import BaseModel, Field
@@ -221,12 +221,32 @@ def init_db() -> None:
     logger.info("State DB initialized at %s", STATE_DB_PATH)
 
 
+# Track background processing tasks so shutdown can wait for them.
+_active_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_task(coro) -> asyncio.Task:
+    """Create a tracked asyncio task that removes itself on completion."""
+    task = asyncio.create_task(coro)
+    _active_tasks.add(task)
+    task.add_done_callback(_active_tasks.discard)
+    return task
+
+
 @app.on_event("startup")
 async def startup_event() -> None:
     log_startup_configuration()
     await asyncio.to_thread(init_db)
     await asyncio.to_thread(load_post_product_map)
-    asyncio.create_task(recover_pending_events())
+    _spawn_task(recover_pending_events())
+
+
+@app.on_event("shutdown")
+async def shutdown_event() -> None:
+    if _active_tasks:
+        logger.info("Shutdown: waiting for %s active task(s) to complete", len(_active_tasks))
+        await asyncio.gather(*_active_tasks, return_exceptions=True)
+        logger.info("Shutdown: all tasks finished")
 
 
 def _new_session() -> dict[str, Any]:
@@ -1988,7 +2008,7 @@ def verify_webhook(
 
 
 @app.post("/webhook")
-async def webhook(request: Request, background_tasks: BackgroundTasks) -> dict[str, Any]:
+async def webhook(request: Request) -> dict[str, Any]:
     raw_body = await request.body()
     signature = request.headers.get("X-Hub-Signature-256")
     logger.info(
@@ -2019,7 +2039,7 @@ async def webhook(request: Request, background_tasks: BackgroundTasks) -> dict[s
         event_ids.append(event_id)
 
     if event_ids:
-        background_tasks.add_task(schedule_event_processing_by_ids, event_ids)
+        _spawn_task(schedule_event_processing_by_ids(event_ids))
 
     logger.info("WEBHOOK POST queued stored=%s", len(event_ids))
 
