@@ -77,13 +77,18 @@ def build_router(deps: RouteDeps) -> APIRouter:
             raise HTTPException(status_code=429, detail="Webhook rate limit exceeded")
 
         event_ids: list[int] = []
+        duplicate_count = 0
         for event in events:
-            event_ids.append(await asyncio.to_thread(deps.insert_event, event))
+            stored_id = await asyncio.to_thread(deps.insert_event, event)
+            if stored_id > 0:
+                event_ids.append(stored_id)
+            else:
+                duplicate_count += 1
 
         if event_ids:
             deps.spawn_processing_by_ids(event_ids)
 
-        deps.logger.info("WEBHOOK POST queued stored=%s", len(event_ids))
+        deps.logger.info("WEBHOOK POST queued stored=%s duplicates=%s", len(event_ids), duplicate_count)
         return {"status": "ok", "queued": len(events), "stored": len(event_ids)}
 
     @router.post("/test")

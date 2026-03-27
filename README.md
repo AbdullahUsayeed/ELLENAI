@@ -58,6 +58,14 @@ Optional reliability tuning knobs (recommended for production-like testing):
 - `USER_RATE_LIMIT_WINDOW_SECONDS` (default `20`)
 - `WEBHOOK_RATE_LIMIT_COUNT` (default `60`)
 - `WEBHOOK_RATE_LIMIT_WINDOW_SECONDS` (default `10`)
+- `BURST_COALESCE_WINDOW_MS` (default `2000`)
+- `BURST_MIN_MESSAGES_TO_TRIGGER` (default `2`)
+
+Webhook security mode:
+
+- `ALLOW_INSECURE_WEBHOOK_SIGNATURES` (default `0`)
+- Keep this `0` in production. If `APP_SECRET` is missing and this remains `0`, webhook requests are rejected.
+- Use `1` only for local testing when you do not have Meta signatures.
 
 Local PowerShell example:
 
