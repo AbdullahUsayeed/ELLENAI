@@ -63,6 +63,8 @@ MIN_ORDER_TOTAL = settings.min_order_total
 OWNER_DM_ID = settings.owner_dm_id
 OWNER_DM_MESSENGER_ID = settings.owner_dm_messenger_id
 OWNER_DM_INSTAGRAM_ID = settings.owner_dm_instagram_id
+BURST_COALESCE_WINDOW_MS = settings.burst_coalesce_window_ms
+BURST_MIN_MESSAGES_TO_TRIGGER = settings.burst_min_messages_to_trigger
 
 PRODUCT = {
     "name": "Oversized Hoodie",
@@ -133,6 +135,11 @@ lock_registry_guard = asyncio.Lock()
 user_rate_buckets: dict[str, deque[float]] = {}
 webhook_rate_bucket: deque[float] = deque()
 rate_limit_guard = asyncio.Lock()
+
+# Message burst coalescing: collect rapid messages and process as one
+burst_pending: dict[str, dict[str, Any]] = {}  # user_id -> {"events": [...], "first_arrival_time": float}
+burst_timers: dict[str, asyncio.Task[Any]] = {}  # user_id -> coalesce timer task
+burst_guard = asyncio.Lock()
 
 
 def log_startup_configuration() -> None:
@@ -698,6 +705,136 @@ async def _allow_webhook_batch(event_count: int) -> bool:
         for _ in range(max(0, event_count)):
             webhook_rate_bucket.append(now)
         return True
+
+
+def _merge_intents_from_burst(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Merge multiple events into a single combined intent, preserving most relevant signals."""
+    merged_intent = "unknown"
+    quantities: list[int] = []
+    colors_found: list[str] = []
+    locations_found: list[str] = []
+    payment_detected = False
+    any_order = False
+    any_deny = False
+    any_question = False
+    combined_text_parts: list[str] = []
+    attachment_urls_all: set[str] = set()
+    attachment_types_all: set[str] = set()
+
+    for event in events:
+        intent_data = event.get("_intent_data", {})
+        combined_text_parts.append(str(event.get("message", "")).strip())
+        
+        current_intent = str(intent_data.get("intent", "unknown"))
+        if current_intent == "order":
+            any_order = True
+        elif current_intent == "deny":
+            any_deny = True
+        elif current_intent == "question":
+            any_question = True
+        elif current_intent not in {"unknown", "question"}:
+            merged_intent = current_intent
+        
+        if qty := int(intent_data.get("quantity", 0)):
+            quantities.append(qty)
+        if color := str(intent_data.get("color", "")).strip():
+            colors_found.append(color)
+        if location := str(intent_data.get("location", "")).strip():
+            locations_found.append(location)
+        
+        payment_detected = payment_detected or bool(intent_data.get("payment_detected", False))
+        
+        attachment_urls = event.get("attachment_urls", [])
+        if isinstance(attachment_urls, list):
+            attachment_urls_all.update(u for u in attachment_urls if isinstance(u, str))
+        attachment_types = event.get("attachment_types", [])
+        if isinstance(attachment_types, list):
+            attachment_types_all.update(t for t in attachment_types if isinstance(t, str))
+
+    # Determine final intent based on priority
+    if payment_detected:
+        merged_intent = "payment"
+    elif any_order:
+        merged_intent = "order"
+    elif any_deny:
+        merged_intent = "deny"
+    elif merged_intent == "unknown":
+        if any_question:
+            merged_intent = "question"
+
+    combined_text = " | ".join(p for p in combined_text_parts if p)
+    
+    return {
+        "intent": merged_intent,
+        "quantity": max(quantities) if quantities else 0,
+        "color": colors_found[-1] if colors_found else None,
+        "location": locations_found[-1] if locations_found else None,
+        "payment_detected": payment_detected,
+        "combined_message": combined_text,
+        "burst_size": len(events),
+    }
+
+
+async def _process_burst(user_id: str, events: list[dict[str, Any]]) -> None:
+    """Process a burst of events as one cohesive interaction."""
+    if not events:
+        return
+
+    logger.info("BURST processing user=%s events=%d", user_id, len(events))
+    
+    # Append all messages to history
+    for event in events:
+        await append_history(
+            user_id,
+            event.get("message", ""),
+            int(event.get("attachments_count", 0)),
+            event.get("attachment_types", []),
+            event.get("attachment_urls", []),
+        )
+    
+    # Merge intents from burst
+    merged_intent_data = _merge_intents_from_burst(events)
+    
+    # Use the first message's source and most complete burst for context
+    first_event = events[0]
+    source = str(first_event.get("source") or "unknown")
+    
+    # For burst: use combined message and all attachments from the burst
+    combined_message = merged_intent_data.get("combined_message", "")
+    attachment_urls = first_event.get("attachment_urls", [])
+    attachment_types = first_event.get("attachment_types", [])
+    
+    final_reply, should_send = await process_message(
+        user_id,
+        combined_message if combined_message else " ".join(e.get("message", "") for e in events),
+        source=source,
+        attachments_count=len(attachment_urls),
+        attachment_types=attachment_types,
+        attachment_urls=attachment_urls,
+    )
+    if should_send:
+        await send_message(user_id, final_reply)
+
+
+async def _coalesce_burst_with_timeout(user_id: str) -> None:
+    """Wait for burst coalesce window, then process all pending events."""
+    try:
+        await asyncio.sleep(BURST_COALESCE_WINDOW_MS / 1000.0)
+        
+        async with burst_guard:
+            burst_info = burst_pending.pop(user_id, None)
+            burst_timers.pop(user_id, None)
+        
+        if burst_info:
+            events = burst_info.get("events", [])
+            event_ids = burst_info.get("event_ids", [])
+            if events:
+                await _process_burst(user_id, events)
+            # Mark all events as done
+            for event_id in event_ids:
+                await asyncio.to_thread(db_mark_incoming_event, event_id, "done", None, False)
+    except Exception as e:
+        logger.exception("Error in burst coalescing for user=%s: %s", user_id, e)
 
 
 def _detect_intent_sync(message: str) -> dict[str, Any]:
@@ -1848,8 +1985,49 @@ async def process_event_by_id(event_id: int) -> None:
         return
 
     try:
-        await process_event(event)
-        await asyncio.to_thread(db_mark_incoming_event, event_id, "done", None, False)
+        user_id = str(event.get("user_id", "")).strip()
+        
+        # Check if burst coalescing should be used
+        async with burst_guard:
+            if user_id not in burst_pending:
+                # First event in potential burst - start coalesce timer
+                burst_pending[user_id] = {
+                    "events": [event],
+                    "first_arrival_time": time.time(),
+                    "event_ids": [event_id],
+                }
+                # Start timeout task
+                timer_task = asyncio.create_task(_coalesce_burst_with_timeout(user_id))
+                burst_timers[user_id] = timer_task
+                logger.info("BURST started user=%s event_id=%s", user_id, event_id)
+                return
+            else:
+                # Additional event in existing burst
+                burst_info = burst_pending[user_id]
+                burst_info["events"].append(event)
+                burst_info["event_ids"].append(event_id)
+                burst_size = len(burst_info["events"])
+                logger.info("BURST appended user=%s event_id=%s burst_size=%d", user_id, event_id, burst_size)
+                
+                # Check if burst is large enough to trigger early processing
+                if burst_size >= 5:
+                    logger.info("BURST max size reached user=%s burst_size=%d, processing early", user_id, burst_size)
+                    burst_pending.pop(user_id, None)
+                    timer = burst_timers.pop(user_id, None)
+                    if timer:
+                        timer.cancel()
+        
+        # If burst reached max size, process it immediately
+        if burst_size >= 5:
+            await _process_burst(user_id, burst_info["events"])
+            # Mark all events as done
+            for eid in burst_info["event_ids"]:
+                await asyncio.to_thread(db_mark_incoming_event, eid, "done", None, False)
+            return
+        else:
+            # Still accumulating, return without marking done
+            return
+        
     except Exception as exc:
         logger.exception("Failed processing event id=%s err=%s", event_id, exc)
         # Keep failed items retriable up to 3 attempts.

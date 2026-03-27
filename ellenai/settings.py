@@ -35,6 +35,8 @@ class Settings:
     owner_dm_id: str
     owner_dm_messenger_id: str
     owner_dm_instagram_id: str
+    burst_coalesce_window_ms: int
+    burst_min_messages_to_trigger: int
 
 
 def load_settings() -> Settings:
@@ -67,4 +69,6 @@ def load_settings() -> Settings:
         owner_dm_id=os.getenv("OWNER_DM_ID", ""),
         owner_dm_messenger_id=os.getenv("OWNER_DM_MESSENGER_ID", ""),
         owner_dm_instagram_id=os.getenv("OWNER_DM_INSTAGRAM_ID", ""),
+        burst_coalesce_window_ms=int(os.getenv("BURST_COALESCE_WINDOW_MS", "2000")),
+        burst_min_messages_to_trigger=int(os.getenv("BURST_MIN_MESSAGES_TO_TRIGGER", "2")),
     )
