@@ -103,7 +103,7 @@ delivery 20-25 days lagbe apu
 niben naki? ami confirm kore rakhi?
 """
 
-INTENTS = {"price", "order", "add_item", "location", "payment", "question", "other", "unknown"}
+INTENTS = {"price", "order", "add_item", "deny", "location", "payment", "question", "other", "unknown"}
 COLOR_WORDS = {
     "black",
     "white",
@@ -602,7 +602,9 @@ def _fallback_detect(message: str) -> dict[str, Any]:
 
     payment_detected = any(k in text for k in ["paid", "payment", "trx", "bkash", "nagad", "rocket", "screenshot"])
 
-    if "shared_post" in text:
+    if any(k in text for k in ["chacchina", "nibo na", "chaina", "cancel", "clear cart", "start over", "reset", "don't want", "do not want", "interested na", "lagbe na"]):
+        intent = "deny"
+    elif "shared_post" in text:
         intent = "add_item"
     elif any(k in text for k in ["order", "confirm", "nibo", "niben", "this one", "eta lagbe"]):
         intent = "order"
@@ -750,7 +752,9 @@ Return JSON only with keys:
 intent, quantity, color, location, payment_detected, is_question
 
 Allowed intent values:
-price | order | add_item | location | payment | question | other | unknown
+price | order | add_item | deny | location | payment | question | other | unknown
+
+Use "deny" when the customer is explicitly rejecting, cancelling, or saying they do NOT want a product (e.g. "chacchina", "nibo na", "cancel", "na na", "I don't want", "clear cart", "start over").
 
 Message:
 {message}
@@ -1318,7 +1322,19 @@ def handle_message(
     if intent == "unknown":
         return _safe_default_reply(), False
 
-    if intent in {"price", "add_item"}:
+    if intent == "deny":
+        session["cart"] = {"items": [], "total_price": 0}
+        session["state"] = 0
+        return "Aight, cart cleared! Onno kisu nite chao?", False
+
+    if intent == "price":
+        product = selected_product or PRODUCT
+        name = str(product.get("name") or PRODUCT["name"])
+        price = int(product.get("price") or PRODUCT["price"])
+        currency = str(product.get("currency") or PRODUCT["currency"])
+        return f"Apu, {name} er price {price} {currency}! Nite chaile bolen, order confirm kore dei. 😊", False
+
+    if intent == "add_item":
         _add_or_update_item(session, quantity, color, product=selected_product)
         session["state"] = 1
 
