@@ -71,6 +71,10 @@ IDLE_TIMEOUT_AFTER_ADDRESS_SECONDS = settings.idle_timeout_after_address_seconds
 SESSION_EXPIRY_DAYS = settings.session_expiry_days
 BURST_MAX_SIZE_HARDCAP = settings.burst_max_size_hardcap
 ENABLE_IDLE_REMINDERS = settings.enable_idle_reminders
+COMPLIANCE_SAFE_MODE = settings.compliance_safe_mode
+DISCLOSE_AUTOMATION_ON_FIRST_REPLY = settings.disclose_automation_on_first_reply
+SUPPRESS_LINKS_ON_FIRST_TOUCH = settings.suppress_links_on_first_touch
+MAX_AUTO_REPLIES_BEFORE_HANDOFF = settings.max_auto_replies_before_handoff
 
 PRODUCT = {
     "name": "Oversized Hoodie",
@@ -80,9 +84,10 @@ PRODUCT = {
 }
 PRODUCT_MAP: dict[str, list[dict[str, Any]]] = {}
 
-PAYMENT_CONFIRMATION_TEXT = "To confirm: send 60% to bKash. Remaining 40% cash on delivery. Secure & fast! ✓"
+PAYMENT_CONFIRMATION_TEXT = "To confirm: send 60% to bKash. Remaining 40% cash on delivery. Secure checkout."
 DELIVERY_CHARGE_TEXT = "Dhaka: 85 tk | Outside: 150 tk | Delivery: 20-25 days"
 DELIVERY_TIME_TEXT = "20-25 days (guaranteed)"
+AUTOMATION_DISCLOSURE_TEXT = "Heads up: this is EllenAI, our automated shop assistant. If you want a person, just say 'human' or 'help'."
 
 BARGAIN_WINDOW_SECONDS = 120
 BARGAIN_CAP_AFTER_COUNT = 3
@@ -99,7 +104,7 @@ Tone:
 Rules:
 
 * Short, punchy replies (1-2 lines max)
-* Use urgency tactfully (limited stock, popular items)
+* Stay helpful and calm
 * Always include clear next step/CTA
 * Never apologize for price - it's fair value
 * If price negotiation: acknowledge but stay firm
@@ -107,11 +112,11 @@ Rules:
 """
 
 STYLE_EXAMPLES = """
-Yes! This is trending right now - 500 people bought last month. 2500 tk, grab it now apu!
+Yes, this is available. 2500 tk. If you want, I can help you choose color and quantity.
 Size: M available. Niben naki? I'll process your order right away.
-Payment 60% bKash, 40% COD - totally secure. Ready to order?
-Stock limited apu - this model is almost soldout. Confirm now, I'll arrange delivery.
-It's premium quality, price is final. But I can add something cute to your order?
+Payment 60% bKash, 40% COD. If you're ready, I can guide you through the next step.
+This design is available now. If you want it, I can confirm the order flow.
+It's premium quality and the price is fixed. If you want, I can help with the order.
 """
 
 INTENTS = {"price", "order", "add_item", "deny", "location", "payment", "question", "other", "unknown"}
@@ -226,6 +231,9 @@ def _new_session() -> dict[str, Any]:
         "state_2_reached_at": None,
         "state_3_reached_at": None,
         "last_idle_reminder_at": None,
+        "automation_disclosure_sent": False,
+        "auto_reply_count": 0,
+        "human_handoff_requested": False,
         "cart": {
             "items": [],
             "total_price": 0,
@@ -517,8 +525,8 @@ def _format_catalog_matches_reply(query: str, source: str, matches: list[tuple[s
         price = int(variant.get("price") or 0)
         currency = str(variant.get("currency") or "tk")
         lines.append(f"{idx}) {name}")
-        lines.append(f"   💰 {price} {currency} | Link: {_canonical_full_link(key)}")
-    lines.append("\n👉 Reply with the number or say 'add' to add to your order! Which one apu? 😊")
+        lines.append(f"   💰 {price} {currency}")
+    lines.append("\n👉 Reply with the number you want. If you need the exact post link, say 'link'.")
     return "\n".join(lines)
 
 
@@ -534,9 +542,9 @@ def _min_order_message(session: dict[str, Any], source: str) -> str:
     if suggestions:
         for idx, (key, variant) in enumerate(suggestions[:3], start=1):
             lines.append(
-                f"{idx}) {variant.get('name', 'Item')} → {int(variant.get('price') or 0)} {variant.get('currency') or 'tk'} | {_canonical_full_link(key)}"
+                f"{idx}) {variant.get('name', 'Item')} → {int(variant.get('price') or 0)} {variant.get('currency') or 'tk'}"
             )
-        lines.append("\n👉 Add one & complete your order! Which one? 😊")
+        lines.append("\n👉 Add one & complete your order. Reply with the item number if you want it.")
     return "\n".join(lines)
 
 
@@ -1247,7 +1255,7 @@ def _safe_default_reply() -> str:
         f"Hmm, I'm not quite sure what you're looking for! 🤔\n\n"
         f"Try one of these:\n"
         f"📸 Share a picture of what you want → I'll find it!\n"
-        f"🔗 Share a link from our posts\n"
+        f"🔗 Share a link from our post if you already have one\n"
         f"💬 Tell me what: {types_list}, and more!\n\n"
         f"What works best apu? 😊"
     )
@@ -1264,12 +1272,56 @@ def _super_confused_reply() -> str:
     )
 
 
+def _owner_targets() -> set[str]:
+    return {
+        str(owner_id).strip()
+        for owner_id in {OWNER_DM_ID, OWNER_DM_MESSENGER_ID, OWNER_DM_INSTAGRAM_ID}
+        if str(owner_id).strip()
+    }
+
+
+def _is_owner_target(user_id: str) -> bool:
+    return str(user_id).strip() in _owner_targets()
+
+
+def _should_disclose_automation(session: dict[str, Any]) -> bool:
+    return COMPLIANCE_SAFE_MODE and DISCLOSE_AUTOMATION_ON_FIRST_REPLY and not bool(session.get("automation_disclosure_sent"))
+
+
+def _should_suppress_links(session: dict[str, Any]) -> bool:
+    if not COMPLIANCE_SAFE_MODE or not SUPPRESS_LINKS_ON_FIRST_TOUCH:
+        return False
+    if int(session.get("state", 0) or 0) >= 1:
+        return False
+    return int(session.get("auto_reply_count", 0) or 0) < 2
+
+
+def _sanitize_links_for_compliance(text: str, session: dict[str, Any]) -> str:
+    if not _should_suppress_links(session):
+        return text
+    sanitized = re.sub(r"https?://\S+", "[link available on request]", text)
+    sanitized = re.sub(r"\|\s*Link:\s*\[link available on request\]", "", sanitized)
+    if sanitized != text and "link available on request" not in sanitized.lower():
+        sanitized += "\n\nIf you want the exact product post, reply 'link'."
+    elif sanitized != text:
+        sanitized += "\n\nIf you want the exact product post, reply 'link'."
+    return sanitized
+
+
+def _apply_customer_compliance(text: str, session: dict[str, Any]) -> str:
+    final_text = _sanitize_links_for_compliance(text, session)
+    if _should_disclose_automation(session):
+        session["automation_disclosure_sent"] = True
+        final_text = f"{AUTOMATION_DISCLOSURE_TEXT}\n\n{final_text}"
+    return final_text
+
+
 def _create_urgency_cta(product_name: str = None) -> str:
     """Generate urgency-focused CTA for closing sales."""
     messages = [
-        "This is selling fast apu - limited stock left!",
-        "Stock alert: Only a few pieces remaining!",
-        "This design just came in - grab it before it's gone!",
+        "If you want this one, I can help you confirm it now.",
+        "If you're ready, I can move this order to the next step.",
+        "If this is your choice, I can help with quantity and address next.",
     ]
     return messages[len(product_name or "") % len(messages)] if product_name else messages[0]
 
@@ -1893,6 +1945,30 @@ async def process_message(
         clean_message = message.strip()
         lower_message = clean_message.lower()
 
+        if lower_message in {"help", "human", "agent", "person", "manual", "owner"}:
+            session["human_handoff_requested"] = True
+            await send_owner_alert(
+                source,
+                f"HUMAN HANDOFF REQUEST\nSource: {source}\nUser: {user_id}\nText: {clean_message or 'manual handoff requested'}",
+            )
+            saved = await asyncio.to_thread(db_save_session, user_id, session)
+            if not saved:
+                logger.warning("Session version conflict while saving handoff request user=%s", user_id)
+            _set_session_cache(user_id, session)
+            return "A team member will continue with you shortly. Please send the product name, screenshot, or question and we'll handle it manually.", True
+
+        if COMPLIANCE_SAFE_MODE and int(session.get("auto_reply_count", 0) or 0) >= max(1, MAX_AUTO_REPLIES_BEFORE_HANDOFF) and previous_state < 3:
+            session["human_handoff_requested"] = True
+            await send_owner_alert(
+                source,
+                f"AUTO HANDOFF TRIGGERED\nSource: {source}\nUser: {user_id}\nState: {previous_state}\nLast text: {clean_message or '(empty)'}",
+            )
+            saved = await asyncio.to_thread(db_save_session, user_id, session)
+            if not saved:
+                logger.warning("Session version conflict while saving auto handoff user=%s", user_id)
+            _set_session_cache(user_id, session)
+            return "I'll hand this conversation to a team member now so we can help you properly.", True
+
         if clean_message and session.get("state") in {0, 1} and _is_catalog_query(clean_message):
             matches = _search_catalog_products(clean_message, source=source, limit=5)
             if matches:
@@ -2116,6 +2192,13 @@ async def send_message(user_id: str, text: str) -> dict[str, Any]:
         logger.warning("send_message skipped, token/page not configured")
         return {"ok": False, "error": "Missing PAGE_ACCESS_TOKEN or PAGE_ID"}
 
+    target_id = str(user_id).strip()
+    is_owner_message = _is_owner_target(target_id)
+    if not is_owner_message:
+        session = session_cache.get(target_id)
+        if session is not None:
+            text = _apply_customer_compliance(text, session)
+
     if MESSAGE_SEND_DELAY_SECONDS > 0:
         await asyncio.sleep(MESSAGE_SEND_DELAY_SECONDS)
 
@@ -2134,6 +2217,10 @@ async def send_message(user_id: str, text: str) -> dict[str, Any]:
                 response = await client_http.post(url, params=params, json=payload)
 
             if response.status_code < 400:
+                if not is_owner_message:
+                    session = session_cache.get(target_id)
+                    if session is not None:
+                        session["auto_reply_count"] = int(session.get("auto_reply_count", 0) or 0) + 1
                 return {"ok": True, "data": response.json()}
 
             body = response.text

@@ -43,6 +43,10 @@ class Settings:
     session_expiry_days: int
     burst_max_size_hardcap: int
     enable_idle_reminders: bool
+    compliance_safe_mode: bool
+    disclose_automation_on_first_reply: bool
+    suppress_links_on_first_touch: bool
+    max_auto_replies_before_handoff: int
 
 
 def load_settings() -> Settings:
@@ -54,7 +58,7 @@ def load_settings() -> Settings:
         app_secret=os.getenv("APP_SECRET", ""),
         admin_token=os.getenv("ADMIN_TOKEN", ""),
         state_db_path=Path(os.getenv("STATE_DB_PATH", "ellenai_state.db")),
-        message_send_delay_seconds=float(os.getenv("MESSAGE_SEND_DELAY_SECONDS", "5")),
+        message_send_delay_seconds=float(os.getenv("MESSAGE_SEND_DELAY_SECONDS", "8")),
         enable_reply_rewrite=os.getenv("ENABLE_REPLY_REWRITE", "1") == "1",
         rewrite_cache_ttl_seconds=int(os.getenv("REWRITE_CACHE_TTL_SECONDS", "900")),
         intent_cache_ttl_seconds=int(os.getenv("INTENT_CACHE_TTL_SECONDS", "300")),
@@ -83,4 +87,8 @@ def load_settings() -> Settings:
         session_expiry_days=int(os.getenv("SESSION_EXPIRY_DAYS", "7")),
         burst_max_size_hardcap=int(os.getenv("BURST_MAX_SIZE_HARDCAP", "20")),
         enable_idle_reminders=os.getenv("ENABLE_IDLE_REMINDERS", "1") == "1",
+        compliance_safe_mode=os.getenv("COMPLIANCE_SAFE_MODE", "1") == "1",
+        disclose_automation_on_first_reply=os.getenv("DISCLOSE_AUTOMATION_ON_FIRST_REPLY", "1") == "1",
+        suppress_links_on_first_touch=os.getenv("SUPPRESS_LINKS_ON_FIRST_TOUCH", "1") == "1",
+        max_auto_replies_before_handoff=int(os.getenv("MAX_AUTO_REPLIES_BEFORE_HANDOFF", "6")),
     )
