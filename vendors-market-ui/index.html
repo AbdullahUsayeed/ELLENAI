@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Vendors Market UI Prototype</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700;9..144,900&family=Manrope:wght@400;500;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="grain"></div>
+  <header class="hero">
+    <div class="hero-copy">
+      <p class="eyebrow">Prototype V1</p>
+      <h1>Vendors
+        <span>Market</span>
+      </h1>
+      <p class="subtitle">
+        A digital bazaar where every vendor owns a tent-style shop with a banner, vibe, and curated products.
+      </p>
+      <div class="hero-actions">
+        <button id="scrollToMarket" class="btn btn-primary">Explore Tents</button>
+        <button class="btn btn-ghost">Become a Vendor</button>
+      </div>
+    </div>
+    <div class="hero-art" aria-hidden="true">
+      <div class="sun"></div>
+      <div class="tent tent-a"></div>
+      <div class="tent tent-b"></div>
+      <div class="tent tent-c"></div>
+    </div>
+  </header>
+
+  <main id="market" class="market-layout">
+    <section class="market-left">
+      <div class="toolbar">
+        <input id="searchInput" type="search" placeholder="Search tents, products, vibe..." />
+        <div id="categoryRow" class="categories"></div>
+      </div>
+
+      <div class="section-head">
+        <h2>Choose a Tent</h2>
+        <p>Tap a vendor to view products in their mini market world.</p>
+      </div>
+
+      <div id="tentsGrid" class="tents-grid"></div>
+    </section>
+
+    <aside class="market-right">
+      <div id="shopPanel" class="shop-panel">
+        <p class="panel-placeholder">Select a tent to open the shop.</p>
+      </div>
+    </aside>
+  </main>
+
+  <template id="tentCardTemplate">
+    <article class="tent-card">
+      <div class="tent-top">
+        <p class="tent-tag"></p>
+        <span class="vendor-rating"></span>
+      </div>
+      <div class="tent-banner"></div>
+      <h3 class="tent-name"></h3>
+      <p class="tent-blurb"></p>
+      <div class="tent-meta">
+        <span class="chip location-chip"></span>
+        <span class="chip items-chip"></span>
+      </div>
+    </article>
+  </template>
+
+  <template id="productCardTemplate">
+    <article class="product-card">
+      <div class="product-image"></div>
+      <div class="product-body">
+        <h4 class="product-title"></h4>
+        <p class="product-desc"></p>
+        <div class="product-foot">
+          <span class="price"></span>
+          <button class="btn btn-small">View</button>
+        </div>
+      </div>
+    </article>
+  </template>
+
+  <script src="app.js"></script>
+</body>
+</html>
